@@ -251,7 +251,8 @@ export async function POST(req) {
     const { NEXT_PUBLIC_SUPABASE_URL: url, NEXT_PUBLIC_SUPABASE_ANON_KEY: key, GEMINI_API_KEY: gk } = process.env;
     if (!url || !key || !gk) return fail('Server is missing Supabase or Gemini environment variables.');
 
-    const sb = createClient(url, key);
+    // A server-only service key (if set) keeps the table private; otherwise the anon key + a SELECT policy is used.
+    const sb = createClient(url, process.env.SUPABASE_SERVICE_ROLE_KEY || key);
     const { data: raw, error } = await sb.from(TABLE).select('*').limit(5000);
     if (error) return fail(`Database error: ${error.message}`);
     const rows = (raw || []).map(normRow);
@@ -358,7 +359,12 @@ PROFILES: ${JSON.stringify(scored.map(({ p, tier, pre }) => ({ id: p.profile_id,
 
     return NextResponse.json({
       candidate: { id: c.profile_id || null, gender: c.gender, age: num(c.age), city: c.city, marital_status: c.marital_status, caste: c.caste },
-      stats: { scanned: sameGender.length, disqualified: sameGender.length - eligible.length },
+      stats: {
+        total: rows.length,
+        scanned: sameGender.length,
+        disqualified: sameGender.length - eligible.length,
+        columns: rows.length && !sameGender.length ? Object.keys(rows[0]) : undefined,
+      },
       results,
     });
   } catch (e) {
