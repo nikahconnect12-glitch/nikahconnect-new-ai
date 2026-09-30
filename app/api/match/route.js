@@ -56,6 +56,14 @@ function geoTier(a, b) {
 }
 
 /* ---------- Helpers ---------- */
+// Column names may be capitalised (Profile_ID, Marital_Status); lower-case them so either style works.
+const normRow = (r) => {
+  const o = {};
+  for (const [k, v] of Object.entries(r)) o[k.toLowerCase()] = v;
+  if (typeof o.age === 'string') o.age = o.age.replace(/\.0+$/, '');
+  return o;
+};
+const idNum = (v) => Number(String(v || '').replace(/\D/g, ''));
 const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, Math.round(n)));
 const num = (v) => { const n = parseInt(v, 10); return Number.isFinite(n) ? n : null; };
 const genderOf = (g) => (/^f/i.test(g || '') ? 'female' : /^m/i.test(g || '') ? 'male' : null);
@@ -244,8 +252,9 @@ export async function POST(req) {
     if (!url || !key || !gk) return fail('Server is missing Supabase or Gemini environment variables.');
 
     const sb = createClient(url, key);
-    const { data: rows, error } = await sb.from(TABLE).select('*').limit(5000);
+    const { data: raw, error } = await sb.from(TABLE).select('*').limit(5000);
     if (error) return fail(`Database error: ${error.message}`);
+    const rows = (raw || []).map(normRow);
 
     const genAI = new GoogleGenerativeAI(gk);
     const models = [MODEL, process.env.GEMINI_FALLBACK_MODEL].filter(Boolean).map((name) =>
@@ -269,7 +278,7 @@ export async function POST(req) {
     // 1) Resolve the candidate: existing profile ID, or extract from pasted text.
     let c;
     const idMatch = prompt.trim().length < 30 && prompt.match(/NC-\d+/i);
-    if (idMatch) c = rows.find((r) => String(r.profile_id).toUpperCase() === idMatch[0].toUpperCase());
+    if (idMatch) c = rows.find((r) => idNum(r.profile_id) === idNum(idMatch[0]));
     if (!c) {
       const parsed = parseBioData(prompt); // no AI needed for the standard template
       if (genderOf(parsed.gender) && num(parsed.age) != null && !isNA(parsed.city)) c = parsed;
