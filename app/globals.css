@@ -1,3 +1,15 @@
 @import "tailwindcss";
-html, body { background: #0a0e17; color: #e2e8f0; }
-::selection { background: #6366f1; color: #fff; }
+
+@theme {
+  --color-maroon: #7b1828;
+  --color-maroon-deep: #5f1120;
+  --color-blush: #f8f1eb;
+  --color-paper: #fdfcfa;
+  --color-sand: #faf6f1;
+  --color-gold: #a5732e;
+  --color-gold-soft: #fbf3dc;
+  --color-ink: #2b2226;
+}
+
+html, body { background: #faf6f1; color: #2b2226; scroll-behavior: smooth; }
+::selection { background: #7b1828; color: #fff; }
