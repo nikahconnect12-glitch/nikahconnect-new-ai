@@ -6,7 +6,7 @@ export const runtime = 'nodejs';
 export const maxDuration = 60;
 
 const TABLE = process.env.SUPABASE_TABLE || 'profiles db';
-   const MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+const MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
 const SHORTLIST = 20;
 const MAX_RESULTS = 12;
 
@@ -190,6 +190,48 @@ function formatProfile(p) {
   ].join('\n');
 }
 
+/* ---------- Reads the standard Nikah Connect template without AI ---------- */
+function parseBioData(text) {
+  const t = String(text || '');
+  const get = (src, label) => {
+    const m = src.match(new RegExp(label + '[ \\t]*:[ \\t]*([^\\n\\r]*)', 'i'));
+    const v = m ? m[1].replace(/[*_]/g, '').trim() : '';
+    return isNA(v) ? null : v;
+  };
+  const ri = t.search(/Requirement[ \t]*\*?[ \t]*\r?\n/i);
+  const cand = ri >= 0 ? t.slice(0, ri) : t;
+  const req = ri >= 0 ? t.slice(ri) : '';
+  const first = t.trim().split('\n')[0].split('/').map((x) => x.trim());
+
+  let gender = get(cand, 'Gender');
+  let age = null, city = get(cand, 'Current City');
+  if (first.length >= 3 && /^\d{1,2}$/.test(first[1])) {
+    gender = gender || first[0]; age = Number(first[1]); city = city || first[2];
+  }
+  const dob = get(cand, 'Date of birth');
+  if (age == null && dob) {
+    const m = dob.match(/(\d{1,2})[\/\-. ](\d{1,2})[\/\-. ](\d{4})/) || dob.match(/()()((?:19|20)\d{2})/);
+    if (m) {
+      const now = new Date();
+      age = now.getFullYear() - Number(m[3]);
+      if (m[1] && (now.getMonth() + 1 < Number(m[2]) || (now.getMonth() + 1 === Number(m[2]) && now.getDate() < Number(m[1])))) age -= 1;
+    }
+  }
+  const src = get(cand, 'Source of income'), inc = get(cand, 'Monthly Income');
+  const house = [get(cand, 'House owned or Rental'), get(cand, 'Home size')].filter(Boolean).join(' ');
+  const other = [get(req, 'Other requirements\\(optional\\)'), get(req, 'Financial Status'), get(req, 'House')].filter(Boolean).join(' / ');
+  return {
+    gender, age, city,
+    marital_status: get(cand, 'Marital status'), height: get(cand, 'Height'), weight: get(cand, 'weight'),
+    education: get(cand, 'Education'), caste: get(cand, 'Caste'), sect_maslak: get(cand, 'Sect \\(Maslak\\)'),
+    profession_salary: [src, inc].filter(Boolean).join(' - ') || null,
+    house_details: house || null,
+    req_marital_status: get(req, 'Marital status'), req_age_range: get(req, 'Age'), req_education: get(req, 'Education'),
+    req_maslak: get(req, 'Sect'), req_caste: get(req, 'Cast'), req_city: get(req, 'City'),
+    other_requirements: other || null,
+  };
+}
+
 /* ---------- Handler ---------- */
 const fail = (error, status = 500) => NextResponse.json({ error }, { status });
 
@@ -205,26 +247,42 @@ export async function POST(req) {
     const { data: rows, error } = await sb.from(TABLE).select('*').limit(5000);
     if (error) return fail(`Database error: ${error.message}`);
 
-    const model = new GoogleGenerativeAI(gk).getGenerativeModel({
-      model: MODEL,
-      generationConfig: { responseMimeType: 'application/json', temperature: 0.2 },
-    });
-    const askJson = async (text) => JSON.parse((await model.generateContent(text)).response.text());
+    const genAI = new GoogleGenerativeAI(gk);
+    const models = [MODEL, process.env.GEMINI_FALLBACK_MODEL].filter(Boolean).map((name) =>
+      genAI.getGenerativeModel({ model: name, generationConfig: { responseMimeType: 'application/json', temperature: 0.2 } })
+    );
+    // Retries when Gemini is busy (503/429) and tries the fallback model if one is set.
+    const askJson = async (text) => {
+      for (let i = 0; i < 3; i++) {
+        for (const m of models) {
+          try {
+            return JSON.parse((await m.generateContent(text)).response.text());
+          } catch (e) {
+            if (!/503|429|overloaded|high demand/i.test(e.message)) throw e;
+          }
+        }
+        await new Promise((r) => setTimeout(r, 1200 * (i + 1)));
+      }
+      throw new Error('Gemini is busy right now. Please try again in a minute.');
+    };
 
     // 1) Resolve the candidate: existing profile ID, or extract from pasted text.
     let c;
-    const idMatch = prompt.match(/NC-\d+/i);
+    const idMatch = prompt.trim().length < 30 && prompt.match(/NC-\d+/i);
     if (idMatch) c = rows.find((r) => String(r.profile_id).toUpperCase() === idMatch[0].toUpperCase());
-       if (!c) {
+    if (!c) {
+      const parsed = parseBioData(prompt); // no AI needed for the standard template
+      if (genderOf(parsed.gender) && num(parsed.age) != null && !isNA(parsed.city)) c = parsed;
+    }
+    if (!c) {
       const today = new Date().toISOString().slice(0, 10);
       c = await askJson(
         `Extract the candidate from this Nikah Connect bio-data (Urdu/English mixed; some fields may be blank). Return JSON with keys:
 gender ("Male" or "Female"),
-age (number; if only Date of birth is given, calculate age as of ${today}; the first line "Gender/age/city/Marital status/caste" may also hold it),
+age (number; if only Date of birth is given, calculate age as of ${today}),
 city (Current City), marital_status, caste, sect_maslak, height, weight, education,
-profession_salary (combine Source of income and Monthly Income),
-house_details (House owned/rental and home size),
-req_marital_status, req_age_range (Requirement > Age), req_city, req_caste (Requirement > Cast), req_maslak (Requirement > Sect), req_education,
+profession_salary (Source of income and Monthly Income), house_details,
+req_marital_status, req_age_range, req_city, req_caste, req_maslak, req_education,
 other_requirements (include Financial Status, House and other requirements).
 Use null for blank fields. Return only JSON.
 
