@@ -237,7 +237,7 @@ const fail = (error, status = 500) => NextResponse.json({ error }, { status });
 
 export async function POST(req) {
   try {
-    const { prompt } = await req.json();
+    const { prompt, notes } = await req.json();
     if (!prompt || !prompt.trim()) return fail('Paste a candidate bio-data or type a profile ID such as NC-102.', 400);
 
     const { NEXT_PUBLIC_SUPABASE_URL: url, NEXT_PUBLIC_SUPABASE_ANON_KEY: key, GEMINI_API_KEY: gk } = process.env;
@@ -319,6 +319,8 @@ ${prompt}`
 Rules: city tier is fixed ("exact", "nearby" -> score 60-80 and mention "Nearby city match", "far" -> max 55). Age and gender are already validated. Give a score 0-100 and 3-4 short, concrete reasons (mention mismatches honestly).
 Return JSON array: [{"id":"NC-001","score":85,"reasons":["..."]}]
 
+EXTRA INSTRUCTIONS FROM STAFF (optional, follow when sensible): ${String(notes || 'none').slice(0, 500)}
+
 CANDIDATE: ${JSON.stringify(brief(c))}
 PROFILES: ${JSON.stringify(scored.map(({ p, tier, pre }) => ({ id: p.profile_id, city_tier: tier, baseline: pre, ...brief(p) })))}`
       );
@@ -337,6 +339,7 @@ PROFILES: ${JSON.stringify(scored.map(({ p, tier, pre }) => ({ id: p.profile_id,
           score: bound(typeof a?.score === 'number' ? a.score : pre, tier),
           tier,
           reasons,
+          info: { age: p.age, height: p.height, city: p.city, education: p.education, work: p.profession_salary, marital: p.marital_status, caste: p.caste, gender: p.gender },
           text: formatProfile(p),
         };
       })
