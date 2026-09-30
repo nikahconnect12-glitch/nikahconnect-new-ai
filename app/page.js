@@ -244,7 +244,13 @@ export default function Home() {
                   Candidate: {data.candidate.gender}, {data.candidate.age}, {data.candidate.city}. Checked {data.stats.scanned} profiles; {data.stats.disqualified} removed by the age rule.
                 </p>
                 {data.results.length === 0 ? (
-                  <p className="mt-6 text-sm text-stone-700">No suitable matches found. Try a bio-data with more detail, or check back after new profiles are added.</p>
+                  <p className="mt-6 text-sm text-stone-700">
+                    {data.stats.total === 0
+                      ? 'The database returned 0 profiles. Check the table name and that read access (RLS policy or service key) is set up in Supabase.'
+                      : data.stats.scanned === 0
+                      ? `No opposite-gender profiles were found among ${data.stats.total} rows. Check the Gender column values. Columns seen: ${(data.stats.columns || []).join(', ')}`
+                      : 'No suitable matches found. Try a bio-data with more detail, or check back after new profiles are added.'}
+                  </p>
                 ) : (
                   <div className="mt-4 space-y-4 xl:max-h-[calc(100vh-11rem)] xl:overflow-y-auto xl:pr-1">
                     {data.results.map((r) => <Result key={r.id} r={r} />)}
