@@ -22,7 +22,6 @@ const SAMPLE = `Female/26/Lahore/Single/Jutt
 👉>-Sect : Sunni
 👉>-Cast: Any
 👉>-City: Lahore`;
-const SAMPLE_NOTE = 'Prefer similar education and a family with religious values.';
 
 const ringColor = (s) => (s > 80 ? '#1f7a4d' : s >= 60 ? '#c58a12' : '#9a8f8f');
 
@@ -66,7 +65,7 @@ function Result({ r }) {
         <div className="min-w-0 flex-1">
           <h3 className="font-[family-name:var(--font-mono)] text-base font-semibold text-ink">{r.id}</h3>
           <p className="text-sm text-stone-600">
-            {[i.age && `${i.age} Years`, i.marital, i.caste].filter(Boolean).join(' · ')}
+            {[i.gender, i.age && `${i.age} Years`, i.marital, i.caste].filter((x) => x && !/^(n\/?a|none)$/i.test(String(x).trim())).join(' · ')}
           </p>
           <ul className="mt-1 space-y-0.5 text-xs text-stone-600">
             {facts.map(([Icon, v], k) => (
@@ -78,9 +77,11 @@ function Result({ r }) {
       </div>
 
       <ul className="mt-3 space-y-1 border-t border-maroon/10 pt-3 text-[13px] text-stone-700">
-        {r.reasons.map((x, k) => (
-          <li key={k} className="flex gap-2"><span className="mt-1.5 size-1.5 shrink-0 rounded-full bg-gold" />{x}</li>
-        ))}
+        {r.reasons.map((x, k) => {
+          const mark = x[0], text = '✓✗!'.includes(mark) ? x.slice(2) : x;
+          const dot = mark === '✓' ? 'bg-emerald-600' : mark === '✗' ? 'bg-rose-500' : 'bg-amber-500';
+          return <li key={k} className="flex gap-2"><span className={`mt-1.5 size-1.5 shrink-0 rounded-full ${dot}`} />{text}</li>;
+        })}
       </ul>
 
       {open && (
@@ -110,7 +111,6 @@ const TRUST = [
 
 export default function Home() {
   const [prompt, setPrompt] = useState('');
-  const [notes, setNotes] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [data, setData] = useState(null);
@@ -130,7 +130,7 @@ export default function Home() {
       const res = await fetch('/api/match', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt, notes }),
+        body: JSON.stringify({ prompt }),
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || 'Request failed');
@@ -199,17 +199,6 @@ export default function Home() {
               />
               <p className="mt-1 text-right text-xs text-stone-400">{prompt.length}/5000</p>
 
-              <div className="mt-4 flex items-start justify-between gap-3">
-                <h2 className={`${serif} flex items-center gap-2 text-xl font-semibold text-ink`}><Sparkles size={20} className="text-maroon" />2. AI Matchmaker Prompt <span className="text-base font-normal text-stone-500">(Optional)</span></h2>
-                <button onClick={() => setNotes(SAMPLE_NOTE)} className="shrink-0 rounded-lg border border-maroon/20 px-3 py-1.5 text-xs font-medium text-maroon hover:bg-blush">Example Prompt</button>
-              </div>
-              <textarea
-                value={notes} maxLength={500} rows={3} onChange={(e) => setNotes(e.target.value)}
-                placeholder="e.g. Prefer similar education and family values. Gender, age and city rules are always applied."
-                className="mt-3 w-full resize-none rounded-2xl border border-maroon/15 bg-white p-4 text-sm text-ink outline-none placeholder:text-stone-400 focus:border-maroon/50 focus:ring-4 focus:ring-maroon/10"
-              />
-              <p className="mt-1 text-right text-xs text-stone-400">{notes.length}/500</p>
-
               <div className="relative mt-4">
                 {!loading && <span className="absolute inset-0 rounded-2xl bg-maroon/40 blur-lg animate-pulse motion-reduce:animate-none" />}
                 <button
@@ -241,7 +230,7 @@ export default function Home() {
             {data && (
               <>
                 <p className="mt-3 text-xs text-stone-500">
-                  Candidate: {data.candidate.gender}, {data.candidate.age}, {data.candidate.city}. Checked {data.stats.scanned} profiles; {data.stats.disqualified} removed by the age rule.
+                  Candidate: {data.candidate.gender}, {data.candidate.age}, {data.candidate.city}. Showing {data.showing} profiles only. Checked {data.stats.scanned}; {data.stats.disqualified} removed by the age rule{data.stats.unknownGender ? `; ${data.stats.unknownGender} profiles skipped because gender is missing in the database` : ''}.
                 </p>
                 {data.results.length === 0 ? (
                   <p className="mt-6 text-sm text-stone-700">
@@ -253,7 +242,16 @@ export default function Home() {
                   </p>
                 ) : (
                   <div className="mt-4 space-y-4 xl:max-h-[calc(100vh-11rem)] xl:overflow-y-auto xl:pr-1">
-                    {data.results.map((r) => <Result key={r.id} r={r} />)}
+                    {data.results.some((r) => r.group === 'best') ? (
+                      <p className="text-sm font-semibold text-emerald-800">Best matches</p>
+                    ) : (
+                      <p className="rounded-xl bg-amber-50 p-3 text-sm text-amber-900">No profile fits the stated requirement fully. These are the closest options, with lower match percentages.</p>
+                    )}
+                    {data.results.filter((r) => r.group === 'best').map((r) => <Result key={r.id} r={r} />)}
+                    {data.results.some((r) => r.group === 'option') && data.results.some((r) => r.group === 'best') && (
+                      <p className="pt-2 text-sm font-semibold text-amber-800">Other options (outside the stated requirement, lower match)</p>
+                    )}
+                    {data.results.filter((r) => r.group === 'option').map((r) => <Result key={r.id} r={r} />)}
                   </div>
                 )}
               </>
