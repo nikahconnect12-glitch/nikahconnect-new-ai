@@ -109,7 +109,7 @@ function sectOf(s) {
   if (/hadee?s|salafi/.test(s)) return 'hadees';
   if (/deoband/.test(s)) return 'deobandi';
   if (/barel|brelvi|ahle sunnat|ahl-e-sunnat/.test(s)) return 'barelvi';
-  if (/sunni/.test(s)) return 'sunni';
+  if (/sunn?i/.test(s)) return 'sunni';
   return null;
 }
 function sectScore(a, b) {
@@ -126,7 +126,7 @@ function eduLevel(s) {
   if (/ph\.?d|doctorate/.test(s)) return 6;
   if (/m\.?\s?phil/.test(s)) return 5;
   if (/mbbs|bds|pharm|\bdpt\b|doctor|\bllb\b/.test(s)) return 4;
-  if (/master|\bm\.?a\b|\bm\.?sc|\bmba\b|\bmcs\b|\bmcom|\bms\b|\bm\.?s\b|16 year|\bmit\b/.test(s)) return 4;
+  if (/master|\bm\.?a\b|\bm\.?sc|\bmba\b|\bmcs\b|\bm\.?\s?com|\bms\b|\bm\.?s\b|16 year|\bmit\b/.test(s)) return 4;
   if (/bachelor|\bbs|\bbcs|\bbba\b|\bb\.?sc|\bb\.?com|\bba\b|\bb\.?a\b|\bbe\b|\bb\.?e\b|\bb\.?tech|graduat|14 year|honou?rs|engineer|\bacca\b|\bca\b/.test(s)) return 3;
   if (/inter|\bf\.?sc|\bf\.?a\b|hssc|a[- ]?level|\bdae\b|12/.test(s)) return 2;
   if (/matric|ssc|o[- ]?level|middle|primary|\b10\b/.test(s)) return 1;
@@ -137,16 +137,19 @@ const inches = (s) => {
   return m ? Number(m[1]) * 12 + Number(m[2] || 0) : null;
 };
 const anyWord = /\b(any|all|no bar|koi bhi|open)\b/i;
+const normCaste = (v) => String(v || '').toLowerCase()
+  .replace(/raj+poo?t/g, 'rajput').replace(/\bj[ua]t+\b/g, 'jutt').replace(/sh[ae]i?kh/g, 'sheikh')
+  .replace(/ara[ye]en|arayen/g, 'arain').replace(/guj+ar/g, 'gujjar').replace(/mug+h?al|mogul/g, 'mughal')
+  .replace(/\bs[ae]y+ed\b|\bsyed\b|\bsaiyed\b/g, 'syed').replace(/qur[ae]i?shi/g, 'qureshi').replace(/\s+/g, ' ').trim();
 const casteOK = (req, caste) => {
   if (isNA(req) || isNA(caste)) return null;
-  const a0 = String(req).toLowerCase(), b0 = String(caste).toLowerCase();
+  const a0 = normCaste(req), b0 = normCaste(caste);
   if (/apart from|except|excluding|other than|siwaye/.test(a0)) return a0.split(/apart from|except|excluding|other than|siwaye/)[1].includes(b0) ? false : null;
   if (anyWord.test(req)) return null;
-  const a = String(req).toLowerCase(), b = String(caste).toLowerCase();
-  return a.includes(b) || b.includes(a);
+  return a0.includes(b0) || b0.includes(a0);
 };
 const singleOnly = (req) => /single|unmarried|never|kuwar|kunwar/i.test(req || '') && !/divorc|widow|any|all|khula|2nd|second/i.test(req || '');
-const priorMarriage = (m) => /divorc|widow|khula|2nd|second|separat|married/i.test(m || '') && !/^(single|unmarried|never)/i.test(String(m).trim());
+const priorMarriage = (m) => /divorc|widow|khula|2nd|second|separat|married|shadi/i.test(m || '') && !/^(single|unmarried|never)/i.test(String(m).trim());
 const AGE_OK = /(any age|age (is )?(no bar|not (a )?(matter|issue|problem)|doesn'?t matter|no issue)|no age (bar|limit|issue)|(younger|older|elder|small|smaller|big|bigger) (is |also |bhi )?(ok|fine|acceptable|allowed|theek|chal\w*)|(chota|choti|bara|bari|chhota|chhoti) (bhi )?(chal|theek|ok|manzoor))/i;
 
 /* Age rule: male >= female. Only an explicit requirement can allow an older female, and never by more than MAX_AGE_GAP years. */
@@ -208,7 +211,7 @@ function evaluate(c, p) {
     if (ok === true) { s += 4; reasons.push(`✓ Caste ${who.caste} matches the ${theirs}'s requirement (${req})`); }
     if (ok === false) { s -= 10; reasons.push(`✗ Caste ${who.caste} is not in the ${theirs}'s requirement (${req})`); }
   }
-  if (!isNA(c.caste) && String(c.caste).trim().toLowerCase() === String(p.caste || '').trim().toLowerCase()) { s += 3; reasons.push(`✓ Same caste (${p.caste})`); }
+  if (!isNA(c.caste) && normCaste(c.caste) === normCaste(p.caste)) { s += 3; reasons.push(`✓ Same caste (${p.caste})`); }
 
   const lc = eduLevel(c.education), lp = eduLevel(p.education);
   if (lc != null && lp != null) {
@@ -216,8 +219,9 @@ function evaluate(c, p) {
     if (d <= 1) { s += 3; reasons.push(`✓ Similar education (${c.education} / ${p.education})`); }
     else if (d >= 3) { s -= 5; reasons.push(`✗ Education levels are far apart (${c.education} / ${p.education})`); }
   }
+  const reqLevel = (r) => { const l = String(r || '').split(/\/|,|\bor\b/i).map(eduLevel).filter((x) => x != null); return l.length ? Math.min(...l) : null; };
   for (const [req, level, edu, who] of [[c.req_education, lp, p.education, 'candidate'], [p.req_education, lc, c.education, 'profile']]) {
-    const need = eduLevel(req);
+    const need = reqLevel(req);
     if (need != null && level != null && level < need) { s -= 8; reasons.push(`✗ Education ${edu} is below the ${who}'s requirement (${req})`); }
   }
 
