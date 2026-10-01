@@ -149,7 +149,7 @@ const singleOnly = (req) => /single|unmarried|never|kuwar|kunwar/i.test(req || '
 const priorMarriage = (m) => /divorc|widow|khula|2nd|second|separat|married/i.test(m || '') && !/^(single|unmarried|never)/i.test(String(m).trim());
 const AGE_OK = /(any age|age (is )?(no bar|not (a )?(matter|issue|problem)|doesn'?t matter|no issue)|no age (bar|limit|issue)|(younger|older|elder|small|smaller|big|bigger) (is |also |bhi )?(ok|fine|acceptable|allowed|theek|chal\w*)|(chota|choti|bara|bari|chhota|chhoti) (bhi )?(chal|theek|ok|manzoor))/i;
 
-/* Age rule: male >= female. Only an explicit requirement can allow an older female, and never by more than EXCEPTION_MAX_GAP years. */
+/* Age rule: male >= female. Only an explicit requirement can allow an older female, and never by more than MAX_AGE_GAP years. */
 function ageCheck(c, p) {
   const cm = genderOf(c.gender) === 'male';
   const male = num(cm ? c.age : p.age), female = num(cm ? p.age : c.age);
@@ -157,7 +157,7 @@ function ageCheck(c, p) {
   if (female <= male) return { status: 'ok', male, female, gap: male - female };
   const gap = female - male;
   const text = `${c.req_age_range || ''} ${c.other_requirements || ''} ${p.req_age_range || ''} ${p.other_requirements || ''}`;
-  if (AGE_OK.test(text) && gap <= EXCEPTION_MAX_GAP) return { status: 'exception', male, female, gap };
+  if (AGE_OK.test(text) && gap <= MAX_AGE_GAP) return { status: 'exception', male, female, gap };
   return { status: 'blocked' };
 }
 
@@ -318,22 +318,26 @@ function formatProfile(p) {
 /* ---------- Reads the standard Nikah Connect template without AI ---------- */
 function parseBioData(text) {
   const t = String(text || '');
-  const get = (src, label) => {
-    const m = src.match(new RegExp(label + '[ \\t]*:[ \\t]*([^\\n\\r]*)', 'i'));
-    const v = m ? m[1].replace(/[*_]/g, '').trim() : '';
-    return isNA(v) ? null : v;
+  const get = (src, ...labels) => {
+    for (const label of labels) {
+      const m = src.match(new RegExp(label + '[ \\t]*:[ \\t]*([^\\n\\r]*)', 'i'));
+      const v = m ? m[1].replace(/[*_]/g, '').trim() : '';
+      if (!isNA(v)) return v;
+    }
+    return null;
   };
-  const ri = t.search(/Requirement[ \t]*\*?[ \t]*\r?\n/i);
+  // The "Requirement" heading may carry emoji or stars around it; everything after it is the requirement part.
+  const ri = t.search(/Requirements?[^\n\w]*\n/i);
   const cand = ri >= 0 ? t.slice(0, ri) : t;
   const req = ri >= 0 ? t.slice(ri) : '';
   const first = t.trim().split('\n')[0].split('/').map((x) => x.trim());
 
   let gender = get(cand, 'Gender');
-  let age = null, city = get(cand, 'Current City');
+  let age = num(get(cand, 'Age')), city = get(cand, 'Current City', 'City');
   if (first.length >= 3 && /^\d{1,2}$/.test(first[1])) {
-    gender = gender || first[0]; age = Number(first[1]); city = city || first[2];
+    gender = gender || first[0]; age = age ?? Number(first[1]); city = city || first[2];
   }
-  const dob = get(cand, 'Date of birth');
+  const dob = get(cand, 'Date of birth', 'DOB');
   if (age == null && dob) {
     const m = dob.match(/(\d{1,2})[\/\-. ](\d{1,2})[\/\-. ](\d{4})/) || dob.match(/()()((?:19|20)\d{2})/);
     if (m) {
@@ -342,17 +346,19 @@ function parseBioData(text) {
       if (m[1] && (now.getMonth() + 1 < Number(m[2]) || (now.getMonth() + 1 === Number(m[2]) && now.getDate() < Number(m[1])))) age -= 1;
     }
   }
-  const src = get(cand, 'Source of income'), inc = get(cand, 'Monthly Income');
-  const house = [get(cand, 'House owned or Rental'), get(cand, 'Home size')].filter(Boolean).join(' ');
-  const other = [get(req, 'Other requirements\\(optional\\)'), get(req, 'Financial Status'), get(req, 'House')].filter(Boolean).join(' / ');
+  const src = get(cand, 'Source of income', 'Profession', 'Occupation'), inc = get(cand, 'Monthly Income');
+  const house = [get(cand, 'House owned or Rental', 'House'), get(cand, 'Home size')].filter(Boolean).join(' ');
+  const other = [get(req, 'Other requirements?[ \\t]*(?:\\(optional\\))?'), get(req, 'Financial Status'), get(req, 'House'), get(req, 'Profession')].filter(Boolean).join(' / ');
   return {
     gender, age, city,
     marital_status: get(cand, 'Marital status'), height: get(cand, 'Height'), weight: get(cand, 'weight'),
-    education: get(cand, 'Education'), caste: get(cand, 'Caste'), sect_maslak: get(cand, 'Sect \\(Maslak\\)'),
+    education: get(cand, 'Education'), caste: get(cand, 'Caste', 'Cast'),
+    sect_maslak: get(cand, 'Sect[ \\t]*\\(Maslak\\)', 'Maslak', 'Sect'),
     profession_salary: [src, inc].filter(Boolean).join(' - ') || null,
     house_details: house || null,
-    req_marital_status: get(req, 'Marital status'), req_age_range: get(req, 'Age'), req_education: get(req, 'Education'),
-    req_maslak: get(req, 'Sect'), req_caste: get(req, 'Cast'), req_city: get(req, 'City'),
+    req_marital_status: get(req, 'Marital status'), req_age_range: get(req, 'Age'), req_height: get(req, 'Height'),
+    req_education: get(req, 'Education'), req_maslak: get(req, 'Sect', 'Maslak'), req_caste: get(req, 'Caste', 'Cast'),
+    req_city: get(req, 'City[ \\t]*/[ \\t]*Country', 'City'),
     other_requirements: other || null,
   };
 }
@@ -442,8 +448,11 @@ export async function POST(req) {
     const evaluated = opposite.map((p) => evaluate(c, p)).filter(Boolean);
 
     const byScore = (a, b) => b.score - a.score;
-    const best = evaluated.filter((e) => e.group === 'best').sort(byScore).slice(0, MAX_BEST);
-    const options = evaluated.filter((e) => e.group === 'option' && e.score >= 30).sort(byScore).slice(0, MAX_OPTIONS);
+    const best = evaluated.filter((e) => e.group === 'best').sort(byScore).slice(0, MAIN_MAX);
+    // Lower-match options are added only when the requirement-based matches are few.
+    const options = best.length < MIN_MAIN
+      ? evaluated.filter((e) => e.group === 'option' && e.score >= 30).sort(byScore).slice(0, SUGG_MAX)
+      : [];
 
     const results = [...best, ...options].map(({ p, tier, score, reasons, group }) => ({
       id: p.profile_id,
