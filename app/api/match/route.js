@@ -363,6 +363,34 @@ function parseBioData(text) {
   };
 }
 
+/* Supabase returns at most 1000 rows per request, so read the table page by page. */
+async function fetchAll(sb) {
+  const probe = await sb.from(TABLE).select('*').limit(1);
+  if (probe.error) return { error: probe.error };
+  if (!probe.data?.length) return { data: [] };
+  const idKey = Object.keys(probe.data[0]).find((k) => /^(profileid|id)$/.test(nk(k)));
+  const all = [];
+  for (let from = 0; from < 50000; from += 1000) {
+    let q = sb.from(TABLE).select('*');
+    if (idKey) q = q.order(idKey);
+    const { data, error } = await q.range(from, from + 999);
+    if (error) return { error };
+    all.push(...data);
+    if (data.length < 1000) break;
+  }
+  return { data: all };
+}
+const uniqRows = (rows) => {
+  const seen = new Set();
+  return rows.filter((r) => {
+    const k = String(r.profile_id ?? '').trim();
+    if (!k) return true;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+};
+
 /* ---------- Handler ---------- */
 const fail = (error, status = 500) => NextResponse.json({ error }, { status });
 
@@ -372,14 +400,15 @@ export async function GET() {
     const { NEXT_PUBLIC_SUPABASE_URL: url, NEXT_PUBLIC_SUPABASE_ANON_KEY: key } = process.env;
     if (!url || !key) return fail('Missing Supabase environment variables.');
     const sb = createClient(url, process.env.SUPABASE_SERVICE_ROLE_KEY || key);
-    const { data: raw, error } = await sb.from(TABLE).select('*').limit(5000);
-    if (error) return fail(`Database error: ${error.message}`);
+    const all = await fetchAll(sb);
+    if (all.error) return fail(`Database error: ${all.error.message}`);
+    const raw = all.data;
     if (!raw?.length) return NextResponse.json({ table: TABLE, rows: 0, problem: 'Table returned 0 rows (wrong table name, empty table, or no read access).' });
     const keys = Object.keys(raw[0]);
     const mapping = {};
     for (const [canon, re] of Object.entries(CANON))
       mapping[canon] = keys.find((k) => k.toLowerCase() === canon) || keys.find((k) => re.test(nk(k))) || 'NOT FOUND';
-    const rows = raw.map(normRow);
+    const rows = uniqRows(raw.map(normRow));
     return NextResponse.json({
       table: TABLE,
       rows: rows.length,
@@ -409,9 +438,9 @@ export async function POST(req) {
 
     // A server-only service key (if set) keeps the table private; otherwise the anon key + a SELECT policy is used.
     const sb = createClient(url, process.env.SUPABASE_SERVICE_ROLE_KEY || key);
-    const { data: raw, error } = await sb.from(TABLE).select('*').limit(5000);
-    if (error) return fail(`Database error: ${error.message}`);
-    const rows = (raw || []).map(normRow);
+    const all = await fetchAll(sb);
+    if (all.error) return fail(`Database error: ${all.error.message}`);
+    const rows = uniqRows(all.data.map(normRow));
 
     // 1) Candidate: profile ID, or the pasted template read by code. Gemini is only a fallback for unusual formats.
     let c;
