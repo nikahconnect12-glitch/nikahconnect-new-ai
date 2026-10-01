@@ -138,7 +138,10 @@ const inches = (s) => {
 };
 const anyWord = /\b(any|all|no bar|koi bhi|open)\b/i;
 const casteOK = (req, caste) => {
-  if (isNA(req) || anyWord.test(req) || isNA(caste)) return null;
+  if (isNA(req) || isNA(caste)) return null;
+  const a0 = String(req).toLowerCase(), b0 = String(caste).toLowerCase();
+  if (/apart from|except|excluding|other than|siwaye/.test(a0)) return a0.split(/apart from|except|excluding|other than|siwaye/)[1].includes(b0) ? false : null;
+  if (anyWord.test(req)) return null;
   const a = String(req).toLowerCase(), b = String(caste).toLowerCase();
   return a.includes(b) || b.includes(a);
 };
@@ -191,6 +194,10 @@ function evaluate(c, p) {
   if (fitC === true) { s += 5; reasons.push(`✓ Candidate's age fits this profile's requirement (${p.req_age_range})`); }
   if (fitC === false) { s -= 12; option = true; reasons.push(`✗ Candidate's age is outside this profile's requirement (${p.req_age_range})`); }
 
+  const hit = (req, city) => !isNA(req) && !isNA(city) && cityList(req).some((x) => cityList(city).some((y) => x === y || x.includes(y) || y.includes(x)));
+  if (hit(c.req_city, p.city)) { s += 3; reasons.push(`✓ ${p.city} is in the candidate's wanted cities (${c.req_city})`); }
+  if (hit(p.req_city, c.city)) { s += 3; reasons.push(`✓ ${c.city} is in this profile's wanted cities (${p.req_city})`); }
+
   const sc = sectScore(c.sect_maslak, p.sect_maslak);
   s += sc;
   if (sc >= 6) reasons.push(`✓ Same sect (${p.sect_maslak})`);
@@ -228,7 +235,7 @@ function evaluate(c, p) {
 
   let score = bound(s, tier);
   if (ac.status === 'unknown') score = Math.min(score, 70);
-  return { p, tier, score, reasons: reasons.slice(0, 7), group: option || score < 60 ? 'option' : 'best' };
+  return { p, tier, score, reasons: reasons.slice(0, 8), group: option || score < 60 ? 'option' : 'best' };
 }
 
 /* ---------- WhatsApp template (exact wording, do not "fix" spellings) ---------- */
@@ -352,6 +359,39 @@ function parseBioData(text) {
 
 /* ---------- Handler ---------- */
 const fail = (error, status = 500) => NextResponse.json({ error }, { status });
+
+/* Open /api/match in the browser to verify the table, column mapping and data quality (no personal data is returned). */
+export async function GET() {
+  try {
+    const { NEXT_PUBLIC_SUPABASE_URL: url, NEXT_PUBLIC_SUPABASE_ANON_KEY: key } = process.env;
+    if (!url || !key) return fail('Missing Supabase environment variables.');
+    const sb = createClient(url, process.env.SUPABASE_SERVICE_ROLE_KEY || key);
+    const { data: raw, error } = await sb.from(TABLE).select('*').limit(5000);
+    if (error) return fail(`Database error: ${error.message}`);
+    if (!raw?.length) return NextResponse.json({ table: TABLE, rows: 0, problem: 'Table returned 0 rows (wrong table name, empty table, or no read access).' });
+    const keys = Object.keys(raw[0]);
+    const mapping = {};
+    for (const [canon, re] of Object.entries(CANON))
+      mapping[canon] = keys.find((k) => k.toLowerCase() === canon) || keys.find((k) => re.test(nk(k))) || 'NOT FOUND';
+    const rows = raw.map(normRow);
+    return NextResponse.json({
+      table: TABLE,
+      rows: rows.length,
+      columns_in_table: keys,
+      mapping,
+      not_found: Object.entries(mapping).filter(([, v]) => v === 'NOT FOUND').map(([k]) => k),
+      gender_counts: {
+        male: rows.filter((r) => genderOf(r.gender) === 'male').length,
+        female: rows.filter((r) => genderOf(r.gender) === 'female').length,
+        missing_or_unreadable: rows.filter((r) => !genderOf(r.gender)).length,
+      },
+      rows_without_numeric_age: rows.filter((r) => num(r.age) == null).length,
+      distinct_gender_values: [...new Set(raw.map((r) => String(r[mapping.gender] ?? '')))].slice(0, 10),
+    });
+  } catch (e) {
+    return fail(e.message || 'Unexpected server error.');
+  }
+}
 
 export async function POST(req) {
   try {
