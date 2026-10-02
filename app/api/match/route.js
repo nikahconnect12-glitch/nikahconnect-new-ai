@@ -103,22 +103,33 @@ function inRange(r, age) {
   if (/max|below|under|upto|up to/i.test(r)) return age <= n[0];
   return Math.abs(age - n[0]) <= 2;
 }
-function sectOf(s) {
+function sectKinds(s) {
   s = String(s || '').toLowerCase();
-  if (/shia|shi'a|jaafri|ithna/.test(s)) return 'shia';
-  if (/hadee?s|salafi/.test(s)) return 'hadees';
-  if (/deoband/.test(s)) return 'deobandi';
-  if (/barel|brelvi|ahle sunnat|ahl-e-sunnat/.test(s)) return 'barelvi';
-  if (/sunn?i/.test(s)) return 'sunni';
-  return null;
+  const k = new Set();
+  if (/shia|shi'a|jaafri|ithna|imami/.test(s)) k.add('shia');
+  if (/hadee?s|salafi/.test(s)) k.add('hadees');
+  if (/deoband/.test(s)) k.add('deobandi');
+  if (/barel|brelvi|ridakhani/.test(s)) k.add('barelvi');
+  if (/sunn?i\b|ahl[ae]?[\s-]*e?[\s-]*sunn?(at|ah|ath)\b/.test(s)) k.add('sunni'); // Sunni / Suni / Ahle Sunnat (wal Jamaat) = general Sunni
+  return k;
 }
 function sectScore(a, b) {
-  const x = sectOf(a), y = sectOf(b);
-  if (!x || !y) return 0;
-  if (x === y) return 6;
-  if (x === 'shia' || y === 'shia') return -25;
-  if ([x, y].includes('hadees') && !['sunni'].includes(x === 'hadees' ? y : x)) return -8;
+  const x = sectKinds(a), y = sectKinds(b);
+  if (!x.size || !y.size) return 0;
+  if ([...x].some((k) => y.has(k))) return 6;
+  if (x.has('shia') || y.has('shia')) return -25;
+  if (x.has('hadees') || y.has('hadees')) return -8;
+  if ((x.has('barelvi') && y.has('deobandi')) || (x.has('deobandi') && y.has('barelvi'))) return -4;
   return 2;
+}
+// Does `sect` satisfy the wanted sect text? General "Sunni" fits any Sunni school.
+function sectFit(req, sect) {
+  const R = sectKinds(req), C = sectKinds(sect);
+  if (!R.size || !C.size) return null;
+  if ([...C].some((k) => R.has(k))) return true;
+  const sub = (S) => [...S].some((k) => k === 'barelvi' || k === 'deobandi');
+  if ((R.has('sunni') && sub(C)) || (C.has('sunni') && sub(R))) return true;
+  return false;
 }
 function eduLevel(s) {
   s = String(s || '').toLowerCase();
@@ -137,17 +148,49 @@ const inches = (s) => {
   return m ? Number(m[1]) * 12 + Number(m[2] || 0) : null;
 };
 const anyWord = /\b(any|all|no bar|koi bhi|open)\b/i;
-const normCaste = (v) => String(v || '').toLowerCase()
-  .replace(/raj+poo?t/g, 'rajput').replace(/\bj[ua]t+\b/g, 'jutt').replace(/sh[ae]i?kh/g, 'sheikh')
-  .replace(/ara[ye]en|arayen/g, 'arain').replace(/guj+ar/g, 'gujjar').replace(/mug+h?al|mogul/g, 'mughal')
-  .replace(/\bs[ae]y+ed\b|\bsyed\b|\bsaiyed\b/g, 'syed').replace(/qur[ae]i?shi/g, 'qureshi').replace(/\s+/g, ' ').trim();
+const CASTE_ALIAS = [
+  [/raj+poo?t|rangh?ar/g, 'rajput'], [/\bj[ua]t+\b/g, 'jutt'], [/\bmemom\b/g, 'memon'], [/\bmehar\b/g, 'mahar'],
+  [/\bkamboj\b|\bkambo\b/g, 'kamboh'], [/sh[ae]i?kh/g, 'sheikh'], [/ara[ye]en|arayen/g, 'arain'], [/guj+ar\b/g, 'gujjar'],
+  [/mug+h?al|mogul|mughul/g, 'mughal'], [/\bs[ae]y+ed\b|\bsaiyed\b/g, 'syed'], [/qur[ae]i?shi/g, 'qureshi'],
+  [/chau?dh?a?ry|chaudhri|choudhry/g, 'chaudhry'],
+];
+// A specific caste/tribe also satisfies its general group (e.g. Khattak -> Pathan). Edit freely.
+const CASTE_GROUPS = {
+  pathan: 'khattak yousafzai afridi shinwari mohmand bangash tareen kakar achakzai kakazai niazi gandapur utmankhail banuchi barozai umarzai mandokhail jadoon swati kasi orakzai durrani wazir mehsud',
+  baloch: 'rind mengal bizenjo bugti marri leghari',
+  syed: 'naqvi kazmi bukhari rizvi zaidi gilani gardezi',
+  rajput: 'chauhan ranny janjua rathore bhatti minhas',
+  kashmiri: 'butt meer wani lone',
+};
+const GROUP_OF = {};
+for (const [g, list] of Object.entries(CASTE_GROUPS)) for (const c of list.split(' ')) GROUP_OF[c] = g;
+const CASTE_STOP = new Set(['preferred', 'preference', 'apart', 'from', 'all', 'only', 'issue', 'non', 'noble', 'except', 'other', 'than', 'compatible', 'urdu', 'speaking', 'khel', 'nai', 'punjabi', 'reverted', 'muslim', 'shahi', 'qutub', 'the', 'and', 'any', 'good', 'caste', 'not', 'indian', 'migrated']);
+const normCaste = (v) => {
+  let x = String(v || '').toLowerCase();
+  for (const [re, t] of CASTE_ALIAS) x = x.replace(re, t);
+  return x.replace(/[^a-z]+/g, ' ').trim();
+};
+const casteTokens = (v) => {
+  const all = normCaste(v).split(' ').filter((t) => t.length > 2);
+  const t = all.filter((x) => !CASTE_STOP.has(x));
+  return t.length ? t : all;
+};
+const casteWithGroups = (v) => { const t = casteTokens(v); return [...new Set([...t, ...t.map((x) => GROUP_OF[x]).filter(Boolean)])]; };
+const hasWord = (text, w) => new RegExp(`\\b${w}\\b`).test(text);
 const casteOK = (req, caste) => {
   if (isNA(req) || isNA(caste)) return null;
-  const a0 = normCaste(req), b0 = normCaste(caste);
-  if (/apart from|except|excluding|other than|siwaye/.test(a0)) return a0.split(/apart from|except|excluding|other than|siwaye/)[1].includes(b0) ? false : null;
+  const r = normCaste(req);
+  const ex = r.match(/apart from|except|excluding|other than|siwaye/);
+  if (ex) return casteTokens(caste).some((t) => hasWord(r.slice(r.indexOf(ex[0]) + ex[0].length), t)) ? false : null;
   if (anyWord.test(req)) return null;
-  return a0.includes(b0) || b0.includes(a0);
+  if (casteWithGroups(caste).some((t) => hasWord(r, t))) return true;
+  // the profile states only a broad group (e.g. "Pathan") while the requirement names one tribe: unknown, not a mismatch
+  const broad = casteTokens(caste).filter((t) => CASTE_GROUPS[t]);
+  if (broad.some((g) => CASTE_GROUPS[g].split(' ').some((m) => hasWord(r, m)))) return null;
+  return false;
 };
+// Words already reviewed in the data. /api/match lists any NEW caste word or sect spelling so it can be added to the groups above.
+const KNOWN_CASTE = new Set(["abbasi", "achakzai", "afridi", "ansari", "any", "arain", "awan", "bajwa", "baloch", "balti", "bangash", "banuchi", "barozai", "bhutto", "bihari", "bizenjo", "butt", "channer", "chaudhry", "chauhan", "compatible", "daadpotra", "daha", "dar", "deobandi", "dogar", "except", "farooqi", "gandapur", "gardezi", "gharshin", "ghuman", "gilani", "good", "gopang", "gujarati", "gujjar", "hashmi", "hiraj", "hunzai", "jadoon", "janjua", "jutt", "kakar", "kakazai", "kamboh", "kashmiri", "kasi", "kazmi", "khan", "khattak", "khel", "khokhar", "kiani", "kolachi", "mahar", "malik", "mandokhail", "mayo", "meer", "memon", "mengal", "mirza", "mohmand", "mughal", "muslim", "nanda", "naqvi", "niazi", "own", "pathan", "pechuho", "phulpoto", "qureshi", "raja", "rajput", "rana", "ranjha", "ranny", "rao", "rathore", "reverted", "rind", "satti", "sheikh", "shia", "shinwari", "sial", "soomro", "speaking", "sunni", "swati", "syed", "tareen", "umarzai", "urdu", "utmankhail", "virk", "warraich", "yousafzai"]);
 const singleOnly = (req) => /single|unmarried|never|kuwar|kunwar/i.test(req || '') && !/divorc|widow|any|all|khula|2nd|second/i.test(req || '');
 const priorMarriage = (m) => /divorc|widow|khula|2nd|second|separat|married|shadi/i.test(m || '') && !/^(single|unmarried|never)/i.test(String(m).trim());
 const AGE_OK = /(any age|age (is )?(no bar|not (a )?(matter|issue|problem)|doesn'?t matter|no issue)|no age (bar|limit|issue)|(younger|older|elder|small|smaller|big|bigger) (is |also |bhi )?(ok|fine|acceptable|allowed|theek|chal\w*)|(chota|choti|bara|bari|chhota|chhoti) (bhi )?(chal|theek|ok|manzoor))/i;
@@ -206,12 +249,16 @@ function evaluate(c, p) {
   if (sc >= 6) reasons.push(`✓ Same sect (${p.sect_maslak})`);
   else if (sc <= -8) reasons.push(`✗ Sect differs (${c.sect_maslak} vs ${p.sect_maslak})`);
 
+  for (const [req, sect, who] of [[c.req_maslak, p.sect_maslak, 'candidate'], [p.req_maslak, c.sect_maslak, 'profile']]) {
+    if (sectFit(req, sect) === false) { s -= 10; reasons.push(`✗ Sect ${sect} is not what the ${who} wants (${req})`); }
+  }
+
   for (const [req, who, theirs] of [[c.req_caste, p, 'candidate'], [p.req_caste, c, 'profile']]) {
     const ok = casteOK(req, who.caste);
     if (ok === true) { s += 4; reasons.push(`✓ Caste ${who.caste} matches the ${theirs}'s requirement (${req})`); }
     if (ok === false) { s -= 10; reasons.push(`✗ Caste ${who.caste} is not in the ${theirs}'s requirement (${req})`); }
   }
-  if (!isNA(c.caste) && normCaste(c.caste) === normCaste(p.caste)) { s += 3; reasons.push(`✓ Same caste (${p.caste})`); }
+  if (!isNA(c.caste) && !isNA(p.caste) && casteTokens(c.caste).some((t) => casteTokens(p.caste).includes(t))) { s += 3; reasons.push(`✓ Same caste (${p.caste})`); }
 
   const lc = eduLevel(c.education), lp = eduLevel(p.education);
   if (lc != null && lp != null) {
@@ -398,6 +445,12 @@ const uniqRows = (rows) => {
 /* ---------- Handler ---------- */
 const fail = (error, status = 500) => NextResponse.json({ error }, { status });
 
+const tally = (vals, fn) => {
+  const m = {};
+  for (const v of vals) for (const x of fn(v)) m[x] = (m[x] || 0) + 1;
+  return Object.entries(m).sort((a, b) => b[1] - a[1]).slice(0, 40);
+};
+
 /* Open /api/match in the browser to verify the table, column mapping and data quality (no personal data is returned). */
 export async function GET() {
   try {
@@ -424,6 +477,8 @@ export async function GET() {
         female: rows.filter((r) => genderOf(r.gender) === 'female').length,
         missing_or_unreadable: rows.filter((r) => !genderOf(r.gender)).length,
       },
+      new_caste_words: tally(rows.flatMap((r) => [r.caste, r.req_caste]), (v) => casteTokens(v).filter((t) => !KNOWN_CASTE.has(t) && !CASTE_GROUPS[t])),
+      unrecognised_sect_values: tally(rows.flatMap((r) => [r.sect_maslak, r.req_maslak]), (v) => (!isNA(v) && !sectKinds(v).size && !/^(islam|muslim|any)$/i.test(String(v).trim()) ? [String(v).trim()] : [])),
       rows_without_numeric_age: rows.filter((r) => num(r.age) == null).length,
       distinct_gender_values: [...new Set(raw.map((r) => String(r[mapping.gender] ?? '')))].slice(0, 10),
     });
