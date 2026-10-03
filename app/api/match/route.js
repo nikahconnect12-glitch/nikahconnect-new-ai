@@ -305,7 +305,7 @@ function formatProfile(p) {
     '',
     `👉>-Gender: ${val(p.gender)}`,
     `👉>-Marital status: ${val(p.marital_status)}`,
-    `👉>-Date of birth: ${val(pick(p, /^(dob|dateofbirth|birth)/))}`,
+    `👉>-Date of birth: ${pick(p, /^(dob|dateofbirth|birth)/) || (num(p.age) != null ? `N/A (Age: ${num(p.age)} years)` : 'N/A')}`,
     `👉>-Height: ${val(p.height)}`,
     `👉>-weight: ${val(p.weight)}`,
     `👉>-Complexion: ${val(pick(p, /^(complexion|colou?r|skin)/))}`,
@@ -367,40 +367,74 @@ function formatProfile(p) {
 }
 
 /* ---------- Reads the standard Nikah Connect template without AI ---------- */
+/* Splits the pasted profile into the candidate part and the requirement part (heading may carry emoji or stars). */
+function splitProfile(t) {
+  let off = 0;
+  for (const line of t.split('\n')) {
+    const words = line.replace(/[^A-Za-z ]/g, ' ').trim().split(/\s+/).filter(Boolean);
+    const heading = /(requirement|expectation|looking for)/i.test(line) && !/^\W*other/i.test(line) &&
+      !/:[ \t]*[A-Za-z0-9]/.test(line) && words.length <= 6;
+    if (heading) return { cand: t.slice(0, off), req: t.slice(off) };
+    off += line.length + 1;
+  }
+  return { cand: t, req: '' };
+}
+
+/* The candidate's age is read ONLY from the candidate part: date of birth, the first line, an "Age:" line, or "34 years".
+   It is never taken from the requirement part, and a range such as "30 - 38" is never accepted as an age. */
+function readAge(text) {
+  const t = String(text || '');
+  const { cand } = splitProfile(t);
+  const now = new Date();
+  const ok = (n) => (n >= 15 && n <= 80 ? n : null);
+  const fromDob = (y, mo, d) => {
+    let a = now.getFullYear() - y;
+    if (mo && (now.getMonth() + 1 < mo || (now.getMonth() + 1 === mo && now.getDate() < (d || 1)))) a -= 1;
+    return ok(a);
+  };
+  const dobLine = (cand.match(/(?:date\s*of\s*birth|\bd\.?o\.?b\.?|birth\s*date)[ \t]*:[ \t]*([^\n\r]*)/i) || [])[1];
+  if (dobLine && !isNA(dobLine)) {
+    let m = dobLine.match(/(\d{1,2})[\/\-. ](\d{1,2})[\/\-. ](\d{4})/);
+    if (m) { const a = fromDob(+m[3], +m[2], +m[1]); if (a) return { age: a, source: 'date of birth' }; }
+    m = dobLine.match(/(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})/);
+    if (m) { const a = fromDob(+m[1], +m[2], +m[3]); if (a) return { age: a, source: 'date of birth' }; }
+    m = dobLine.match(/(\d{1,2})\s*(?:st|nd|rd|th)?\s*([A-Za-z]{3,9})\.?,?\s*((?:19|20)\d{2})/);
+    const MON = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+    if (m && MON.indexOf(m[2].slice(0, 3).toLowerCase()) >= 0) { const a = fromDob(+m[3], MON.indexOf(m[2].slice(0, 3).toLowerCase()) + 1, +m[1]); if (a) return { age: a, source: 'date of birth' }; }
+    m = dobLine.match(/\b((?:19|20)\d{2})\b/);
+    if (m) { const a = fromDob(+m[1]); if (a) return { age: a, source: 'birth year' }; }
+  }
+  const first = t.trim().split('\n')[0].split('/').map((x) => x.trim());
+  if (first.length >= 3 && /^\d{2}$/.test(first[1]) && ok(Number(first[1]))) return { age: Number(first[1]), source: 'first line' };
+  const am = cand.match(/(?:^|\n)[^\n\w]*age[ \t]*(?:\([^)]*\))?[ \t]*:[ \t]*(\d{2})(?![ \t]*(?:-|–|—|to\b)[ \t]*\d)/i);
+  if (am && ok(Number(am[1]))) return { age: Number(am[1]), source: 'Age line' };
+  const ym = cand.match(/\b(\d{2})[ \t]*(?:years?|yrs?|saal|sal)\b/i);
+  if (ym && ok(Number(ym[1]))) return { age: Number(ym[1]), source: 'years in text' };
+  return null;
+}
+
 function parseBioData(text) {
   const t = String(text || '');
   const get = (src, ...labels) => {
     for (const label of labels) {
-      const m = src.match(new RegExp(label + '[ \\t]*:[ \\t]*([^\\n\\r]*)', 'i'));
+      const m = src.match(new RegExp('(?:^|[^A-Za-z])' + label + '[ \\t]*:[ \\t]*([^\\n\\r]*)', 'i'));
       const v = m ? m[1].replace(/[*_]/g, '').trim() : '';
       if (!isNA(v)) return v;
     }
     return null;
   };
-  // The "Requirement" heading may carry emoji or stars around it; everything after it is the requirement part.
-  const ri = t.search(/Requirements?[^\n\w]*\n/i);
-  const cand = ri >= 0 ? t.slice(0, ri) : t;
-  const req = ri >= 0 ? t.slice(ri) : '';
+  const { cand, req } = splitProfile(t);
   const first = t.trim().split('\n')[0].split('/').map((x) => x.trim());
-
   let gender = get(cand, 'Gender');
-  let age = num(get(cand, 'Age')), city = get(cand, 'Current City', 'City');
-  if (first.length >= 3 && /^\d{1,2}$/.test(first[1])) {
-    gender = gender || first[0]; age = age ?? Number(first[1]); city = city || first[2];
-  }
-  const dob = get(cand, 'Date of birth', 'DOB');
-  if (age == null && dob) {
-    const m = dob.match(/(\d{1,2})[\/\-. ](\d{1,2})[\/\-. ](\d{4})/) || dob.match(/()()((?:19|20)\d{2})/);
-    if (m) {
-      const now = new Date();
-      age = now.getFullYear() - Number(m[3]);
-      if (m[1] && (now.getMonth() + 1 < Number(m[2]) || (now.getMonth() + 1 === Number(m[2]) && now.getDate() < Number(m[1])))) age -= 1;
-    }
-  }
+  let city = get(cand, 'Current City', 'City');
+  if (first.length >= 3 && /^\d{1,2}$/.test(first[1])) { gender = gender || first[0]; city = city || first[2]; }
+  const ra = readAge(t);
+  const age = ra ? ra.age : null;
   const src = get(cand, 'Source of income', 'Profession', 'Occupation'), inc = get(cand, 'Monthly Income');
   const house = [get(cand, 'House owned or Rental', 'House'), get(cand, 'Home size')].filter(Boolean).join(' ');
   const other = [get(req, 'Other requirements?[ \\t]*(?:\\(optional\\))?'), get(req, 'Financial Status'), get(req, 'House'), get(req, 'Profession')].filter(Boolean).join(' / ');
   return {
+    age_source: ra ? ra.source : null,
     gender, age, city,
     marital_status: get(cand, 'Marital status'), height: get(cand, 'Height'), weight: get(cand, 'weight'),
     education: get(cand, 'Education'), caste: get(cand, 'Caste', 'Cast'),
@@ -526,8 +560,12 @@ export async function POST(req) {
         }
       } catch (e) { console.error('Gemini extraction failed:', e.message); }
     }
+    if (c && !c.profile_id) {
+      const ra = readAge(prompt); // the age always comes from code, never from the AI
+      c.age = ra ? ra.age : null; c.age_source = ra ? ra.source : null;
+    } else if (c) c.age_source = 'database';
     if (!c || !genderOf(c.gender) || num(c.age) == null || isNA(c.city))
-      return fail('Could not read Gender, age and city from this text. Please fill them in (use the standard template or a profile ID such as NC-102).', 422);
+      return fail('Could not find the Gender, age and city of the candidate. Age is read only from the date of birth or an "Age: 34" line in the candidate part. Add it (for example a first line like Female/34/Lahore) or use a profile ID such as NC-102.', 422);
 
     // 2) Hard rules: opposite gender only; male age >= female age (see ageCheck).
     const want = genderOf(c.gender) === 'male' ? 'female' : 'male';
@@ -553,7 +591,7 @@ export async function POST(req) {
     }));
 
     return NextResponse.json({
-      candidate: { id: c.profile_id || null, gender: c.gender, age: num(c.age), city: c.city, marital_status: c.marital_status, caste: c.caste },
+      candidate: { id: c.profile_id || null, gender: c.gender, age: num(c.age), age_source: c.age_source || null, city: c.city, marital_status: c.marital_status, caste: c.caste },
       showing: want,
       stats: {
         total: rows.length,
