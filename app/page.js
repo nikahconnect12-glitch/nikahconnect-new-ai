@@ -132,7 +132,10 @@ export default function Home() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt }),
       });
-      const json = await res.json();
+      const raw = await res.text();
+      let json;
+      try { json = JSON.parse(raw); }
+      catch { throw new Error(res.ok ? 'The server sent an empty reply. Please press the button again.' : `The server did not answer properly (code ${res.status}). Please try again in a minute.`); }
       if (!res.ok) throw new Error(json.error || 'Request failed');
       setData(json);
     } catch (e) { setError(e.message); }
@@ -230,7 +233,7 @@ export default function Home() {
             {data && (
               <>
                 <p className="mt-3 text-xs text-stone-500">
-                  Candidate: {data.candidate.gender}, {data.candidate.age}, {data.candidate.city}. Showing {data.showing} profiles only. Checked {data.stats.scanned}; {data.stats.disqualified} removed by the age rule{data.stats.unknownGender ? `; ${data.stats.unknownGender} profiles skipped because gender is missing in the database` : ''}.
+                  Candidate: {data.candidate.gender}, {data.candidate.age} years{data.candidate.age_source ? ` (age read from ${data.candidate.age_source})` : ''}, {data.candidate.city}. Showing {data.showing} profiles only. Checked {data.stats.scanned}; {data.stats.disqualified} removed by the age rule{data.stats.unknownGender ? `; ${data.stats.unknownGender} profiles skipped because gender is missing in the database` : ''}.
                 </p>
                 {data.results.length === 0 ? (
                   <p className="mt-6 text-sm text-stone-700">
