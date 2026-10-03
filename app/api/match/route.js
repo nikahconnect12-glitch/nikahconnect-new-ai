@@ -1,264 +1,613 @@
-'use client';
-import { useEffect, useRef, useState } from 'react';
-import { Home as HomeIcon, Users, Sparkles, ShieldCheck, Lock, HeartHandshake, Target, MapPin, GraduationCap, Briefcase, Loader2, AlertCircle, FileText, Ruler } from 'lucide-react';
+import { NextResponse } from 'next/server';
+import { createClient } from '@supabase/supabase-js';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
-const SAMPLE = `Female/26/Lahore/Single/Jutt
+export const runtime = 'nodejs';
+export const maxDuration = 60;
 
-🔵 *Candidate Info*
-👉>-Gender: Female
-👉>-Marital status: Single
-👉>-Date of birth: 12/03/2000
-👉>-Height: 5'4
-👉>-Education: Masters
-👉>-Source of income: Software Engineer
-👉>-Sect (Maslak) : Sunni
-👉>-Caste : Jutt
-👉>-Current City: Lahore
+const TABLE = process.env.SUPABASE_TABLE || 'profiles db';
+const MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash'; // used ONLY to read pasted text that does not follow the template
+const MAIN_MAX = 12;      // best matches shown
+const SUGG_MAX = 6;       // lower-match options shown below, only when best matches are few
+const MIN_MAIN = 5;       // fewer best matches than this -> lower-match options are added
+const MAX_AGE_GAP = 3;    // a female is NEVER more than 3 years older than the male
 
-🔵 *Requirement*
-👉>-Marital status: Single
-👉>-Age: 28-32
-👉>-Education : Masters
-👉>-Sect : Sunni
-👉>-Cast: Any
-👉>-City: Lahore`;
+/* ---------- Geography: nearby-city graph (edit freely) ---------- */
+const NEAR = {
+  lahore: ['sheikhupura', 'gujranwala', 'kasur', 'muridke', 'okara', 'nankana sahib', 'kamoke', 'farooqabad'],
+  sheikhupura: ['farooqabad', 'muridke', 'nankana sahib', 'hafizabad', 'jaranwala', 'gujranwala'],
+  gujranwala: ['sialkot', 'gujrat', 'wazirabad', 'hafizabad', 'kamoke', 'muridke', 'kharian', 'mandi bahauddin'],
+  sialkot: ['gujrat', 'daska', 'wazirabad', 'narowal'],
+  gujrat: ['kharian', 'jhelum', 'lalamusa', 'mandi bahauddin', 'wazirabad'],
+  kharian: ['jhelum', 'lalamusa'],
+  jhelum: ['rawalpindi', 'dina', 'mangla'],
+  rawalpindi: ['islamabad', 'taxila', 'wah cantt', 'attock', 'murree'],
+  islamabad: ['taxila', 'wah cantt', 'murree'],
+  faisalabad: ['jaranwala', 'chiniot', 'sargodha', 'toba tek singh', 'jhang', 'samundri'],
+  jaranwala: ['nankana sahib', 'toba tek singh'],
+  sargodha: ['bhalwal', 'chiniot', 'khushab'],
+  sahiwal: ['okara', 'pakpattan', 'chichawatni'],
+  okara: ['pakpattan', 'depalpur', 'kasur'],
+  multan: ['khanewal', 'lodhran', 'vehari', 'muzaffargarh', 'shujabad', 'bahawalpur'],
+  vehari: ['mailsi', 'burewala', 'lodhran'],
+  mailsi: ['burewala', 'lodhran'],
+  bahawalpur: ['bahawalnagar', 'rahim yar khan', 'lodhran'],
+  'rahim yar khan': ['khanpur', 'sadiqabad', 'liaquatpur'],
+  khanpur: ['sadiqabad', 'liaquatpur'],
+  'dg khan': ['layyah', 'muzaffargarh', 'rajanpur', 'taunsa'],
+  karachi: ['hyderabad', 'thatta', 'kotri'],
+  hyderabad: ['kotri', 'jamshoro', 'tando allahyar'],
+  peshawar: ['mardan', 'nowshera', 'charsadda', 'swabi'],
+  quetta: ['pishin'],
+};
+const ADJ = {};
+for (const [a, list] of Object.entries(NEAR))
+  for (const b of list) ((ADJ[a] ||= new Set()).add(b), (ADJ[b] ||= new Set()).add(a));
+const ALIAS = { pindi: 'rawalpindi', isb: 'islamabad', 'd g khan': 'dg khan', 'dera ghazi khan': 'dg khan' };
 
-const ringColor = (s) => (s > 80 ? '#1f7a4d' : s >= 60 ? '#c58a12' : '#9a8f8f');
+const canon = (s) => {
+  const c = s.toLowerCase().replace(/\./g, '').replace(/\s+/g, ' ').trim();
+  return ALIAS[c] || c;
+};
+const cityList = (s) => String(s || '').split(/[\/,&]|\bor\b/i).map(canon).filter(Boolean);
+function geoTier(a, b) {
+  const A = cityList(a), B = cityList(b);
+  if (A.some((x) => B.includes(x))) return 'exact';
+  if (A.some((x) => B.some((y) => ADJ[x]?.has(y)))) return 'nearby';
+  return 'far';
+}
 
-async function copyText(t) {
-  try { await navigator.clipboard.writeText(t); }
-  catch {
-    const el = Object.assign(document.createElement('textarea'), { value: t });
-    document.body.appendChild(el); el.select(); document.execCommand('copy'); el.remove();
+/* ---------- Helpers ---------- */
+const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, Math.round(n)));
+const num = (v) => { const n = parseInt(v, 10); return Number.isFinite(n) ? n : null; };
+const genderOf = (g) => (/^\s*f/i.test(g || '') ? 'female' : /^\s*m/i.test(g || '') ? 'male' : null);
+const isNA = (v) => v == null || !String(v).trim() || /^(n\/?a|none|null|nil|-)$/i.test(String(v).trim());
+const val = (v) => (isNA(v) ? 'N/A' : String(v).trim());
+const nk = (k) => String(k).toLowerCase().replace(/[^a-z0-9]/g, '');
+
+// Maps whatever the database columns are called onto the names this app uses.
+const CANON = {
+  profile_id: /^(profileid|id)$/, gender: /^gender/, age: /^age$/, city: /^(city|currentcity)$/,
+  marital_status: /^marital/, height: /^height/, weight: /^weight/, education: /^education/,
+  caste: /^cast/, sect_maslak: /^(sect|maslak)/,
+  profession_salary: /^(professionsalary|profession|occupation|sourceofincome)/,
+  house_details: /^(housedetails|houseownedorrental|house)$/,
+  contact_number: /^(contactnumber|familycontact|phone|whatsapp)/,
+  req_marital_status: /^req.*marital/, req_age_range: /^req.*age/, req_height: /^req.*height/,
+  req_education: /^req.*education/, req_maslak: /^req.*(sect|maslak)/, req_caste: /^req.*cast/,
+  req_city: /^req.*city/, other_requirements: /^(otherrequirements|reqother)/,
+};
+function normRow(r) {
+  const o = {};
+  for (const [k, v] of Object.entries(r)) o[k.toLowerCase()] = v;
+  const keys = Object.keys(r);
+  for (const [canon, re] of Object.entries(CANON)) {
+    if (!isNA(o[canon])) continue;
+    const k = keys.find((x) => re.test(nk(x)) && !isNA(r[x]));
+    if (k) o[canon] = r[k];
+  }
+  if (typeof o.age === 'string') o.age = o.age.replace(/\.0+$/, '');
+  return o;
+}
+const pick = (p, re) => {
+  for (const k of Object.keys(p)) if (re.test(nk(k)) && !isNA(p[k])) return String(p[k]).trim();
+  return null;
+};
+const idNum = (v) => Number(String(v || '').replace(/\D/g, ''));
+
+function inRange(r, age) {
+  if (isNA(r) || age == null) return null;
+  const n = (String(r).match(/\d+/g) || []).map(Number);
+  if (!n.length) return null;
+  if (n.length >= 2) return age >= n[0] && age <= n[1];
+  if (/max|below|under|upto|up to/i.test(r)) return age <= n[0];
+  return Math.abs(age - n[0]) <= 2;
+}
+function sectKinds(s) {
+  s = String(s || '').toLowerCase();
+  const k = new Set();
+  if (/shia|shi'a|jaafri|ithna|imami/.test(s)) k.add('shia');
+  if (/hadee?s|salafi/.test(s)) k.add('hadees');
+  if (/deoband/.test(s)) k.add('deobandi');
+  if (/barel|brelvi|ridakhani/.test(s)) k.add('barelvi');
+  if (/sunn?i\b|ahl[ae]?[\s-]*e?[\s-]*sunn?(at|ah|ath)\b/.test(s)) k.add('sunni'); // Sunni / Suni / Ahle Sunnat (wal Jamaat) = general Sunni
+  return k;
+}
+function sectScore(a, b) {
+  const x = sectKinds(a), y = sectKinds(b);
+  if (!x.size || !y.size) return 0;
+  if ([...x].some((k) => y.has(k))) return 6;
+  if (x.has('shia') || y.has('shia')) return -25;
+  if (x.has('hadees') || y.has('hadees')) return -8;
+  if ((x.has('barelvi') && y.has('deobandi')) || (x.has('deobandi') && y.has('barelvi'))) return -4;
+  return 2;
+}
+// Does `sect` satisfy the wanted sect text? General "Sunni" fits any Sunni school.
+function sectFit(req, sect) {
+  const R = sectKinds(req), C = sectKinds(sect);
+  if (!R.size || !C.size) return null;
+  if ([...C].some((k) => R.has(k))) return true;
+  const sub = (S) => [...S].some((k) => k === 'barelvi' || k === 'deobandi');
+  if ((R.has('sunni') && sub(C)) || (C.has('sunni') && sub(R))) return true;
+  return false;
+}
+function eduLevel(s) {
+  s = String(s || '').toLowerCase();
+  if (isNA(s)) return null;
+  if (/ph\.?d|doctorate/.test(s)) return 6;
+  if (/m\.?\s?phil/.test(s)) return 5;
+  if (/mbbs|bds|pharm|\bdpt\b|doctor|\bllb\b/.test(s)) return 4;
+  if (/master|\bm\.?a\b|\bm\.?sc|\bmba\b|\bmcs\b|\bm\.?\s?com|\bms\b|\bm\.?s\b|16 year|\bmit\b/.test(s)) return 4;
+  if (/bachelor|\bbs|\bbcs|\bbba\b|\bb\.?sc|\bb\.?com|\bba\b|\bb\.?a\b|\bbe\b|\bb\.?e\b|\bb\.?tech|graduat|14 year|honou?rs|engineer|\bacca\b|\bca\b/.test(s)) return 3;
+  if (/inter|\bf\.?sc|\bf\.?a\b|hssc|a[- ]?level|\bdae\b|12/.test(s)) return 2;
+  if (/matric|ssc|o[- ]?level|middle|primary|\b10\b/.test(s)) return 1;
+  return null;
+}
+const inches = (s) => {
+  const m = String(s || '').match(/(\d)\s*(?:'|’|ft|feet|\.)\s*(\d{1,2})?/i);
+  return m ? Number(m[1]) * 12 + Number(m[2] || 0) : null;
+};
+const anyWord = /\b(any|all|no bar|koi bhi|open)\b/i;
+const CASTE_ALIAS = [
+  [/raj+poo?t|rangh?ar/g, 'rajput'], [/\bj[ua]t+\b/g, 'jutt'], [/\bmemom\b/g, 'memon'], [/\bmehar\b/g, 'mahar'],
+  [/\bkamboj\b|\bkambo\b/g, 'kamboh'], [/sh[ae]i?kh/g, 'sheikh'], [/ara[ye]en|arayen/g, 'arain'], [/guj+ar\b/g, 'gujjar'],
+  [/mug+h?al|mogul|mughul/g, 'mughal'], [/\bs[ae]y+ed\b|\bsaiyed\b/g, 'syed'], [/qur[ae]i?shi/g, 'qureshi'],
+  [/chau?dh?a?ry|chaudhri|choudhry/g, 'chaudhry'],
+];
+// A specific caste/tribe also satisfies its general group (e.g. Khattak -> Pathan). Edit freely.
+const CASTE_GROUPS = {
+  pathan: 'khattak yousafzai afridi shinwari mohmand bangash tareen kakar achakzai kakazai niazi gandapur utmankhail banuchi barozai umarzai mandokhail jadoon swati kasi orakzai durrani wazir mehsud',
+  baloch: 'rind mengal bizenjo bugti marri leghari',
+  syed: 'naqvi kazmi bukhari rizvi zaidi gilani gardezi',
+  rajput: 'chauhan ranny janjua rathore bhatti minhas',
+  kashmiri: 'butt meer wani lone',
+};
+const GROUP_OF = {};
+for (const [g, list] of Object.entries(CASTE_GROUPS)) for (const c of list.split(' ')) GROUP_OF[c] = g;
+const CASTE_STOP = new Set(['preferred', 'preference', 'apart', 'from', 'all', 'only', 'issue', 'non', 'noble', 'except', 'other', 'than', 'compatible', 'urdu', 'speaking', 'khel', 'nai', 'punjabi', 'reverted', 'muslim', 'shahi', 'qutub', 'the', 'and', 'any', 'good', 'caste', 'not', 'indian', 'migrated']);
+const normCaste = (v) => {
+  let x = String(v || '').toLowerCase();
+  for (const [re, t] of CASTE_ALIAS) x = x.replace(re, t);
+  return x.replace(/[^a-z]+/g, ' ').trim();
+};
+const casteTokens = (v) => {
+  const all = normCaste(v).split(' ').filter((t) => t.length > 2);
+  const t = all.filter((x) => !CASTE_STOP.has(x));
+  return t.length ? t : all;
+};
+const casteWithGroups = (v) => { const t = casteTokens(v); return [...new Set([...t, ...t.map((x) => GROUP_OF[x]).filter(Boolean)])]; };
+const hasWord = (text, w) => new RegExp(`\\b${w}\\b`).test(text);
+const casteOK = (req, caste) => {
+  if (isNA(req) || isNA(caste)) return null;
+  const r = normCaste(req);
+  const ex = r.match(/apart from|except|excluding|other than|siwaye/);
+  if (ex) return casteTokens(caste).some((t) => hasWord(r.slice(r.indexOf(ex[0]) + ex[0].length), t)) ? false : null;
+  if (anyWord.test(req)) return null;
+  if (casteWithGroups(caste).some((t) => hasWord(r, t))) return true;
+  // the profile states only a broad group (e.g. "Pathan") while the requirement names one tribe: unknown, not a mismatch
+  const broad = casteTokens(caste).filter((t) => CASTE_GROUPS[t]);
+  if (broad.some((g) => CASTE_GROUPS[g].split(' ').some((m) => hasWord(r, m)))) return null;
+  return false;
+};
+// Words already reviewed in the data. /api/match lists any NEW caste word or sect spelling so it can be added to the groups above.
+const KNOWN_CASTE = new Set(["abbasi", "achakzai", "afridi", "ansari", "any", "arain", "awan", "bajwa", "baloch", "balti", "bangash", "banuchi", "barozai", "bhutto", "bihari", "bizenjo", "butt", "channer", "chaudhry", "chauhan", "compatible", "daadpotra", "daha", "dar", "deobandi", "dogar", "except", "farooqi", "gandapur", "gardezi", "gharshin", "ghuman", "gilani", "good", "gopang", "gujarati", "gujjar", "hashmi", "hiraj", "hunzai", "jadoon", "janjua", "jutt", "kakar", "kakazai", "kamboh", "kashmiri", "kasi", "kazmi", "khan", "khattak", "khel", "khokhar", "kiani", "kolachi", "mahar", "malik", "mandokhail", "mayo", "meer", "memon", "mengal", "mirza", "mohmand", "mughal", "muslim", "nanda", "naqvi", "niazi", "own", "pathan", "pechuho", "phulpoto", "qureshi", "raja", "rajput", "rana", "ranjha", "ranny", "rao", "rathore", "reverted", "rind", "satti", "sheikh", "shia", "shinwari", "sial", "soomro", "speaking", "sunni", "swati", "syed", "tareen", "umarzai", "urdu", "utmankhail", "virk", "warraich", "yousafzai"]);
+const singleOnly = (req) => /single|unmarried|never|kuwar|kunwar/i.test(req || '') && !/divorc|widow|any|all|khula|2nd|second/i.test(req || '');
+const priorMarriage = (m) => /divorc|widow|khula|2nd|second|separat|married|shadi/i.test(m || '') && !/^(single|unmarried|never)/i.test(String(m).trim());
+const AGE_OK = /(any age|age (is )?(no bar|not (a )?(matter|issue|problem)|doesn'?t matter|no issue)|no age (bar|limit|issue)|(younger|older|elder|small|smaller|big|bigger) (is |also |bhi )?(ok|fine|acceptable|allowed|theek|chal\w*)|(chota|choti|bara|bari|chhota|chhoti) (bhi )?(chal|theek|ok|manzoor))/i;
+
+/* Age rule: male >= female. Only an explicit requirement can allow an older female, and never by more than MAX_AGE_GAP years. */
+function ageCheck(c, p) {
+  const cm = genderOf(c.gender) === 'male';
+  const male = num(cm ? c.age : p.age), female = num(cm ? p.age : c.age);
+  if (male == null || female == null) return { status: 'unknown' };
+  if (female <= male) return { status: 'ok', male, female, gap: male - female };
+  const gap = female - male;
+  const text = `${c.req_age_range || ''} ${c.other_requirements || ''} ${p.req_age_range || ''} ${p.other_requirements || ''}`;
+  if (AGE_OK.test(text) && gap <= MAX_AGE_GAP) return { status: 'exception', male, female, gap };
+  return { status: 'blocked' };
+}
+
+const bound = (s, tier) => (tier === 'exact' ? clamp(s, 0, 100) : tier === 'nearby' ? clamp(s, 0, 80) : clamp(s, 0, 55));
+function tierNote(tier, c, p) {
+  if (tier === 'exact') return `✓ Exact city match (${p.city})`;
+  if (tier === 'nearby') return `✓ Nearby city match (${c.city} ↔ ${p.city})`;
+  return `✗ Different city (${c.city} vs ${p.city})`;
+}
+
+/* Everything below is computed from the stored data only. No AI text is shown to the user. */
+function evaluate(c, p) {
+  const ac = ageCheck(c, p);
+  if (ac.status === 'blocked') return null;
+  const tier = geoTier(c.city, p.city);
+  let s = tier === 'exact' ? 80 : tier === 'nearby' ? 66 : 40;
+  let option = tier === 'far';
+  const reasons = [tierNote(tier, c, p)];
+
+  if (ac.status === 'unknown') {
+    option = true; s = Math.min(s, 70);
+    reasons.push('! Age is missing for one side, so the age rule could not be verified');
+  } else if (ac.status === 'exception') {
+    option = true; s -= 8;
+    reasons.push(`! Exception: female is ${ac.gap} year(s) older, allowed by a stated requirement`);
+  } else {
+    reasons.push(`✓ Age rule met (male ${ac.male}, female ${ac.female})`);
+    if (ac.gap > 10) { s -= 8; reasons.push(`! Large age gap (${ac.gap} years)`); }
+  }
+  const fitP = inRange(c.req_age_range, num(p.age)); // does this profile fit the candidate's wanted age?
+  const fitC = inRange(p.req_age_range, num(c.age)); // does the candidate fit this profile's wanted age?
+  if (fitP === true) { s += 5; reasons.push(`✓ Age ${p.age} is within the candidate's required range (${c.req_age_range})`); }
+  if (fitP === false) { s -= 12; option = true; reasons.push(`✗ Age ${p.age} is outside the candidate's required range (${c.req_age_range})`); }
+  if (fitC === true) { s += 5; reasons.push(`✓ Candidate's age fits this profile's requirement (${p.req_age_range})`); }
+  if (fitC === false) { s -= 12; option = true; reasons.push(`✗ Candidate's age is outside this profile's requirement (${p.req_age_range})`); }
+
+  const hit = (req, city) => !isNA(req) && !isNA(city) && cityList(req).some((x) => cityList(city).some((y) => x === y || x.includes(y) || y.includes(x)));
+  if (hit(c.req_city, p.city)) { s += 3; reasons.push(`✓ ${p.city} is in the candidate's wanted cities (${c.req_city})`); }
+  if (hit(p.req_city, c.city)) { s += 3; reasons.push(`✓ ${c.city} is in this profile's wanted cities (${p.req_city})`); }
+
+  const sc = sectScore(c.sect_maslak, p.sect_maslak);
+  s += sc;
+  if (sc >= 6) reasons.push(`✓ Same sect (${p.sect_maslak})`);
+  else if (sc <= -8) reasons.push(`✗ Sect differs (${c.sect_maslak} vs ${p.sect_maslak})`);
+
+  for (const [req, sect, who] of [[c.req_maslak, p.sect_maslak, 'candidate'], [p.req_maslak, c.sect_maslak, 'profile']]) {
+    if (sectFit(req, sect) === false) { s -= 10; reasons.push(`✗ Sect ${sect} is not what the ${who} wants (${req})`); }
+  }
+
+  for (const [req, who, theirs] of [[c.req_caste, p, 'candidate'], [p.req_caste, c, 'profile']]) {
+    const ok = casteOK(req, who.caste);
+    if (ok === true) { s += 4; reasons.push(`✓ Caste ${who.caste} matches the ${theirs}'s requirement (${req})`); }
+    if (ok === false) { s -= 10; reasons.push(`✗ Caste ${who.caste} is not in the ${theirs}'s requirement (${req})`); }
+  }
+  if (!isNA(c.caste) && !isNA(p.caste) && casteTokens(c.caste).some((t) => casteTokens(p.caste).includes(t))) { s += 3; reasons.push(`✓ Same caste (${p.caste})`); }
+
+  const lc = eduLevel(c.education), lp = eduLevel(p.education);
+  if (lc != null && lp != null) {
+    const d = Math.abs(lc - lp);
+    if (d <= 1) { s += 3; reasons.push(`✓ Similar education (${c.education} / ${p.education})`); }
+    else if (d >= 3) { s -= 5; reasons.push(`✗ Education levels are far apart (${c.education} / ${p.education})`); }
+  }
+  const reqLevel = (r) => { const l = String(r || '').split(/\/|,|\bor\b/i).map(eduLevel).filter((x) => x != null); return l.length ? Math.min(...l) : null; };
+  for (const [req, level, edu, who] of [[c.req_education, lp, p.education, 'candidate'], [p.req_education, lc, c.education, 'profile']]) {
+    const need = reqLevel(req);
+    if (need != null && level != null && level < need) { s -= 8; reasons.push(`✗ Education ${edu} is below the ${who}'s requirement (${req})`); }
+  }
+
+  for (const [req, other, who] of [[c.req_marital_status, p.marital_status, 'candidate'], [p.req_marital_status, c.marital_status, 'profile']]) {
+    if (singleOnly(req) && priorMarriage(other)) { s -= 12; reasons.push(`✗ ${who} asks for single, but the other side is ${other}`); }
+  }
+  if (!isNA(c.marital_status) && String(c.marital_status).trim().toLowerCase() === String(p.marital_status || '').trim().toLowerCase())
+    reasons.push(`✓ Same marital status (${p.marital_status})`);
+
+  const rh = inches(c.req_height), ph = inches(p.height);
+  if (rh && ph) {
+    if (ph >= rh) { s += 2; reasons.push(`✓ Height ${p.height} meets the requirement (${c.req_height})`); }
+    else { s -= 4; reasons.push(`✗ Height ${p.height} is below the requirement (${c.req_height})`); }
+  }
+
+  let score = bound(s, tier);
+  if (ac.status === 'unknown') score = Math.min(score, 70);
+  return { p, tier, score, reasons: reasons.slice(0, 8), group: option || score < 60 ? 'option' : 'best' };
+}
+
+/* ---------- WhatsApp template (exact wording, do not "fix" spellings) ---------- */
+function formatProfile(p) {
+  const income = pick(p, /^(monthlyincome|income|salary)$/) ||
+    (String(p.profession_salary || '').match(/\(([^)]*\d[^)]*)\)|\d+\s?(?:k|lac|lakh)\+?/i) || [])[1] ||
+    (String(p.profession_salary || '').match(/\d+\s?(?:k|lac|lakh)\+?/i) || [])[0];
+  const source = pick(p, /^(sourceofincome|occupation|job)$/) || p.profession_salary;
+  const size = pick(p, /^(homesize|housesize)/) || (String(p.house_details || '').match(/\d+(?:\s*(?:to|-)\s*\d+)?\s*(?:marla|kanal)s?/i) || [])[0];
+  return [
+    `${val(p.gender)}/${val(p.age)}/${val(p.city)}/${val(p.marital_status)}/${val(p.caste)}`,
+    '',
+    'https://www.nikahconnect.pro',
+    '',
+    '🔵 *Candidate Info* ',
+    '',
+    `👉>-Gender: ${val(p.gender)}`,
+    `👉>-Marital status: ${val(p.marital_status)}`,
+    `👉>-Date of birth: ${pick(p, /^(dob|dateofbirth|birth)/) || (num(p.age) != null ? `N/A (Age: ${num(p.age)} years)` : 'N/A')}`,
+    `👉>-Height: ${val(p.height)}`,
+    `👉>-weight: ${val(p.weight)}`,
+    `👉>-Complexion: ${val(pick(p, /^(complexion|colou?r|skin)/))}`,
+    `👉>-Education: ${val(p.education)}`,
+    `👉>-College/University: ${val(pick(p, /^(college|university|institute)/))}`,
+    `👉>-Religious education(optional): ${val(pick(p, /^(religiouseducation|islamiceducation|deeni)/))}`,
+    `👉>-Monthly Income: ${val(income)}`,
+    `👉>-Source of income: ${val(source)}`,
+    `👉>-Sect (Maslak) : ${val(p.sect_maslak)}`,
+    `👉>-Caste : ${val(p.caste)}`,
+    `👉>-Beard/Hijab: ${val(pick(p, /^(beard|hijab)/))}`,
+    `👉>-Language: ${val(pick(p, /^language/))}`,
+    `👉>-Disability : ${val(pick(p, /^disab/))}`,
+    '',
+    '🔵 *Family Status* ',
+    '',
+    `👉>-Father’s Profession: ${val(pick(p, /^father/))}`,
+    `👉>-Mother profession: ${val(pick(p, /^mother/))}`,
+    '',
+    '🔵>- *Siblings Details:*  ',
+    '',
+    `Sisters: ${val(pick(p, /^sisters?$/))}`,
+    `Brother's: ${val(pick(p, /^brothers?$/))}`,
+    `Married siblings: ${val(pick(p, /^married/))}`,
+    '',
+    '🔵 *Residence* ',
+    '',
+    `👉>-House owned or Rental: ${val(p.house_details)}`,
+    `👉>-Home size: ${val(size)}`,
+    `👉>-Other properties (optional): ${val(pick(p, /^(otherproperties|properties)/))}`,
+    `👉>-Current City: ${val(p.city)}`,
+    `👉>-Name of Area/Twon(Optional): ${val(pick(p, /^(area|town|nameofarea)/))}`,
+    `👉>-Nationality : ${val(pick(p, /^nationality/))}`,
+    '',
+    '🔵 *Requirement* ',
+    '',
+    `👉>-Marital status: ${val(p.req_marital_status)}`,
+    `👉>-Financial Status: ${val(pick(p, /^req.*(financ|income)/))}`,
+    `👉>-Age: ${val(p.req_age_range)}`,
+    `👉>-Height: ${val(p.req_height)}`,
+    `👉>-Education : ${val(p.req_education)}`,
+    `👉>-Sect : ${val(p.req_maslak)}`,
+    `👉>-Cast: ${val(p.req_caste)}`,
+    `👉>-House: ${val(pick(p, /^req.*house/))}`,
+    `👉>-City: ${val(p.req_city)}`,
+    `👉>-Country: ${val(pick(p, /^req.*country/))}`,
+    `👉>-Other requirements(optional): ${val(p.other_requirements)}`,
+    '',
+    '🔵*Contact details*',
+    '',
+    `Family Contact number(compulsory): ${val(p.contact_number)}`,
+    `👉>-Relation with candidate: ${val(pick(p, /^relation/))}`,
+    `👉>-Self contact only for male(optional): ${val(pick(p, /^selfcontact/))}`,
+    '',
+    `👉>- Anything else you want to tell about canidate (optional): ${val(pick(p, /^(anything|additional|remarks|notes?)/))}`,
+    '',
+    '*#Nikah_Connect (Pakistan largest family based Rishta platform) Contact#03000825815*',
+  ].join('\n');
+}
+
+/* ---------- Reads the standard Nikah Connect template without AI ---------- */
+/* Splits the pasted profile into the candidate part and the requirement part (heading may carry emoji or stars). */
+function splitProfile(t) {
+  let off = 0;
+  for (const line of t.split('\n')) {
+    const words = line.replace(/[^A-Za-z ]/g, ' ').trim().split(/\s+/).filter(Boolean);
+    const heading = /(requirement|expectation|looking for)/i.test(line) && !/^\W*other/i.test(line) &&
+      !/:[ \t]*[A-Za-z0-9]/.test(line) && words.length <= 6;
+    if (heading) return { cand: t.slice(0, off), req: t.slice(off) };
+    off += line.length + 1;
+  }
+  return { cand: t, req: '' };
+}
+
+/* The candidate's age is read ONLY from the candidate part: date of birth, the first line, an "Age:" line, or "34 years".
+   It is never taken from the requirement part, and a range such as "30 - 38" is never accepted as an age. */
+function readAge(text) {
+  const t = String(text || '');
+  const { cand } = splitProfile(t);
+  const now = new Date();
+  const ok = (n) => (n >= 15 && n <= 80 ? n : null);
+  const fromDob = (y, mo, d) => {
+    let a = now.getFullYear() - y;
+    if (mo && (now.getMonth() + 1 < mo || (now.getMonth() + 1 === mo && now.getDate() < (d || 1)))) a -= 1;
+    return ok(a);
+  };
+  const dobLine = (cand.match(/(?:date\s*of\s*birth|\bd\.?o\.?b\.?|birth\s*date)[ \t]*:[ \t]*([^\n\r]*)/i) || [])[1];
+  if (dobLine && !isNA(dobLine)) {
+    let m = dobLine.match(/(\d{1,2})[\/\-. ](\d{1,2})[\/\-. ](\d{4})/);
+    if (m) { const a = fromDob(+m[3], +m[2], +m[1]); if (a) return { age: a, source: 'date of birth' }; }
+    m = dobLine.match(/(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})/);
+    if (m) { const a = fromDob(+m[1], +m[2], +m[3]); if (a) return { age: a, source: 'date of birth' }; }
+    m = dobLine.match(/(\d{1,2})\s*(?:st|nd|rd|th)?\s*([A-Za-z]{3,9})\.?,?\s*((?:19|20)\d{2})/);
+    const MON = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+    if (m && MON.indexOf(m[2].slice(0, 3).toLowerCase()) >= 0) { const a = fromDob(+m[3], MON.indexOf(m[2].slice(0, 3).toLowerCase()) + 1, +m[1]); if (a) return { age: a, source: 'date of birth' }; }
+    m = dobLine.match(/\b((?:19|20)\d{2})\b/);
+    if (m) { const a = fromDob(+m[1]); if (a) return { age: a, source: 'birth year' }; }
+  }
+  const first = t.trim().split('\n')[0].split('/').map((x) => x.trim());
+  if (first.length >= 3 && /^\d{2}$/.test(first[1]) && ok(Number(first[1]))) return { age: Number(first[1]), source: 'first line' };
+  const am = cand.match(/(?:^|\n)[^\n\w]*age[ \t]*(?:\([^)]*\))?[ \t]*:[ \t]*(\d{2})(?![ \t]*(?:-|–|—|to\b)[ \t]*\d)/i);
+  if (am && ok(Number(am[1]))) return { age: Number(am[1]), source: 'Age line' };
+  const ym = cand.match(/\b(\d{2})[ \t]*(?:years?|yrs?|saal|sal)\b/i);
+  if (ym && ok(Number(ym[1]))) return { age: Number(ym[1]), source: 'years in text' };
+  return null;
+}
+
+function parseBioData(text) {
+  const t = String(text || '');
+  const get = (src, ...labels) => {
+    for (const label of labels) {
+      const m = src.match(new RegExp('(?:^|[^A-Za-z])' + label + '[ \\t]*:[ \\t]*([^\\n\\r]*)', 'i'));
+      const v = m ? m[1].replace(/[*_]/g, '').trim() : '';
+      if (!isNA(v)) return v;
+    }
+    return null;
+  };
+  const { cand, req } = splitProfile(t);
+  const first = t.trim().split('\n')[0].split('/').map((x) => x.trim());
+  let gender = get(cand, 'Gender');
+  let city = get(cand, 'Current City', 'City');
+  if (first.length >= 3 && /^\d{1,2}$/.test(first[1])) { gender = gender || first[0]; city = city || first[2]; }
+  const ra = readAge(t);
+  const age = ra ? ra.age : null;
+  const src = get(cand, 'Source of income', 'Profession', 'Occupation'), inc = get(cand, 'Monthly Income');
+  const house = [get(cand, 'House owned or Rental', 'House'), get(cand, 'Home size')].filter(Boolean).join(' ');
+  const other = [get(req, 'Other requirements?[ \\t]*(?:\\(optional\\))?'), get(req, 'Financial Status'), get(req, 'House'), get(req, 'Profession')].filter(Boolean).join(' / ');
+  return {
+    age_source: ra ? ra.source : null,
+    gender, age, city,
+    marital_status: get(cand, 'Marital status'), height: get(cand, 'Height'), weight: get(cand, 'weight'),
+    education: get(cand, 'Education'), caste: get(cand, 'Caste', 'Cast'),
+    sect_maslak: get(cand, 'Sect[ \\t]*\\(Maslak\\)', 'Maslak', 'Sect'),
+    profession_salary: [src, inc].filter(Boolean).join(' - ') || null,
+    house_details: house || null,
+    req_marital_status: get(req, 'Marital status'), req_age_range: get(req, 'Age'), req_height: get(req, 'Height'),
+    req_education: get(req, 'Education'), req_maslak: get(req, 'Sect', 'Maslak'), req_caste: get(req, 'Caste', 'Cast'),
+    req_city: get(req, 'City[ \\t]*/[ \\t]*Country', 'City'),
+    other_requirements: other || null,
+  };
+}
+
+/* Supabase returns at most 1000 rows per request, so read the table page by page. */
+async function fetchAll(sb) {
+  const probe = await sb.from(TABLE).select('*').limit(1);
+  if (probe.error) return { error: probe.error };
+  if (!probe.data?.length) return { data: [] };
+  const idKey = Object.keys(probe.data[0]).find((k) => /^(profileid|id)$/.test(nk(k)));
+  const all = [];
+  for (let from = 0; from < 50000; from += 1000) {
+    let q = sb.from(TABLE).select('*');
+    if (idKey) q = q.order(idKey);
+    const { data, error } = await q.range(from, from + 999);
+    if (error) return { error };
+    all.push(...data);
+    if (data.length < 1000) break;
+  }
+  return { data: all };
+}
+const uniqRows = (rows) => {
+  const seen = new Set();
+  return rows.filter((r) => {
+    const k = String(r.profile_id ?? '').trim();
+    if (!k) return true;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+};
+
+/* ---------- Handler ---------- */
+const fail = (error, status = 500) => NextResponse.json({ error }, { status });
+
+const tally = (vals, fn) => {
+  const m = {};
+  for (const v of vals) for (const x of fn(v)) m[x] = (m[x] || 0) + 1;
+  return Object.entries(m).sort((a, b) => b[1] - a[1]).slice(0, 40);
+};
+
+/* Open /api/match in the browser to verify the table, column mapping and data quality (no personal data is returned). */
+export async function GET() {
+  try {
+    const { NEXT_PUBLIC_SUPABASE_URL: url, NEXT_PUBLIC_SUPABASE_ANON_KEY: key } = process.env;
+    if (!url || !key) return fail('Missing Supabase environment variables.');
+    const sb = createClient(url, process.env.SUPABASE_SERVICE_ROLE_KEY || key);
+    const all = await fetchAll(sb);
+    if (all.error) return fail(`Database error: ${all.error.message}`);
+    const raw = all.data;
+    if (!raw?.length) return NextResponse.json({ table: TABLE, rows: 0, problem: 'Table returned 0 rows (wrong table name, empty table, or no read access).' });
+    const keys = Object.keys(raw[0]);
+    const mapping = {};
+    for (const [canon, re] of Object.entries(CANON))
+      mapping[canon] = keys.find((k) => k.toLowerCase() === canon) || keys.find((k) => re.test(nk(k))) || 'NOT FOUND';
+    const rows = uniqRows(raw.map(normRow));
+    return NextResponse.json({
+      table: TABLE,
+      rows: rows.length,
+      columns_in_table: keys,
+      mapping,
+      not_found: Object.entries(mapping).filter(([, v]) => v === 'NOT FOUND').map(([k]) => k),
+      gender_counts: {
+        male: rows.filter((r) => genderOf(r.gender) === 'male').length,
+        female: rows.filter((r) => genderOf(r.gender) === 'female').length,
+        missing_or_unreadable: rows.filter((r) => !genderOf(r.gender)).length,
+      },
+      new_caste_words: tally(rows.flatMap((r) => [r.caste, r.req_caste]), (v) => casteTokens(v).filter((t) => !KNOWN_CASTE.has(t) && !CASTE_GROUPS[t])),
+      unrecognised_sect_values: tally(rows.flatMap((r) => [r.sect_maslak, r.req_maslak]), (v) => (!isNA(v) && !sectKinds(v).size && !/^(islam|muslim|any)$/i.test(String(v).trim()) ? [String(v).trim()] : [])),
+      rows_without_numeric_age: rows.filter((r) => num(r.age) == null).length,
+      distinct_gender_values: [...new Set(raw.map((r) => String(r[mapping.gender] ?? '')))].slice(0, 10),
+    });
+  } catch (e) {
+    return fail(e.message || 'Unexpected server error.');
   }
 }
 
-function Ring({ score }) {
-  const r = 22, c = 2 * Math.PI * r;
-  return (
-    <div className="flex flex-col items-center">
-      <svg width="56" height="56" viewBox="0 0 56 56" role="img" aria-label={`${score}% match`}>
-        <circle cx="28" cy="28" r={r} fill="none" stroke="#efe6e0" strokeWidth="5" />
-        <circle cx="28" cy="28" r={r} fill="none" stroke={ringColor(score)} strokeWidth="5" strokeLinecap="round"
-          strokeDasharray={`${(score / 100) * c} ${c}`} transform="rotate(-90 28 28)" />
-        <text x="28" y="33" textAnchor="middle" fontSize="14" fontWeight="700" fill={ringColor(score)}>{score}%</text>
-      </svg>
-      <span className="text-[11px] text-stone-500">Match</span>
-    </div>
-  );
-}
+export async function POST(req) {
+  try {
+    const { prompt } = await req.json();
+    if (!prompt || !prompt.trim()) return fail('Paste a candidate bio-data or type a profile ID such as NC-102.', 400);
 
-function Result({ r }) {
-  const [copied, setCopied] = useState(false);
-  const [open, setOpen] = useState(false);
-  const i = r.info || {};
-  const onCopy = async () => { await copyText(r.text); setCopied(true); setTimeout(() => setCopied(false), 2000); };
-  const facts = [
-    [MapPin, i.city], [Ruler, i.height], [GraduationCap, i.education], [Briefcase, i.work],
-  ].filter(([, v]) => v && !/^(n\/?a|none)$/i.test(String(v).trim()));
-  return (
-    <article className="rounded-2xl border border-maroon/10 bg-paper p-4 shadow-sm">
-      <div className="flex gap-3">
-        <span className="grid size-14 shrink-0 place-items-center rounded-xl bg-blush font-[family-name:var(--font-serif)] text-lg font-semibold text-maroon">
-          {String(r.id).replace(/\D/g, '') || 'NC'}
-        </span>
-        <div className="min-w-0 flex-1">
-          <h3 className="font-[family-name:var(--font-mono)] text-base font-semibold text-ink">{r.id}</h3>
-          <p className="text-sm text-stone-600">
-            {[i.gender, i.age && `${i.age} Years`, i.marital, i.caste].filter((x) => x && !/^(n\/?a|none)$/i.test(String(x).trim())).join(' · ')}
-          </p>
-          <ul className="mt-1 space-y-0.5 text-xs text-stone-600">
-            {facts.map(([Icon, v], k) => (
-              <li key={k} className="flex items-center gap-1.5 truncate"><Icon size={12} className="shrink-0 text-maroon/70" />{v}</li>
-            ))}
-          </ul>
-        </div>
-        <Ring score={r.score} />
-      </div>
+    const { NEXT_PUBLIC_SUPABASE_URL: url, NEXT_PUBLIC_SUPABASE_ANON_KEY: key, GEMINI_API_KEY: gk } = process.env;
+    if (!url || !key) return fail('Server is missing Supabase environment variables.');
 
-      <ul className="mt-3 space-y-1 border-t border-maroon/10 pt-3 text-[13px] text-stone-700">
-        {r.reasons.map((x, k) => {
-          const mark = x[0], text = '✓✗!'.includes(mark) ? x.slice(2) : x;
-          const dot = mark === '✓' ? 'bg-emerald-600' : mark === '✗' ? 'bg-rose-500' : 'bg-amber-500';
-          return <li key={k} className="flex gap-2"><span className={`mt-1.5 size-1.5 shrink-0 rounded-full ${dot}`} />{text}</li>;
-        })}
-      </ul>
+    // A server-only service key (if set) keeps the table private; otherwise the anon key + a SELECT policy is used.
+    const sb = createClient(url, process.env.SUPABASE_SERVICE_ROLE_KEY || key);
+    const all = await fetchAll(sb);
+    if (all.error) return fail(`Database error: ${all.error.message}`);
+    const rows = uniqRows(all.data.map(normRow));
 
-      {open && (
-        <pre className="mt-3 max-h-60 overflow-auto rounded-xl border border-maroon/10 bg-blush/70 p-3 font-[family-name:var(--font-mono)] text-[11px] leading-relaxed whitespace-pre-wrap text-maroon-deep">
-          {r.text}
-        </pre>
-      )}
+    // 1) Candidate: profile ID, or the pasted template read by code. Gemini is only a fallback for unusual formats.
+    let c;
+    const idMatch = prompt.trim().length < 30 && prompt.match(/NC-\d+/i);
+    if (idMatch) c = rows.find((r) => idNum(r.profile_id) === idNum(idMatch[0]));
+    if (!c) {
+      const parsed = parseBioData(prompt);
+      if (genderOf(parsed.gender) && num(parsed.age) != null && !isNA(parsed.city)) c = parsed;
+    }
+    // Gemini is only a fallback for gender/city, and only when the age is already readable (the age never comes from the AI).
+    if (!c && gk && readAge(prompt)) {
+      try {
+        const genAI = new GoogleGenerativeAI(gk);
+        const models = [MODEL, process.env.GEMINI_FALLBACK_MODEL].filter(Boolean).map((name) =>
+          genAI.getGenerativeModel({ model: name, generationConfig: { responseMimeType: 'application/json', temperature: 0 } })
+        );
+        const today = new Date().toISOString().slice(0, 10);
+        const ask = `Extract the candidate from this Nikah Connect bio-data. Copy only what is written; never guess. Return JSON with keys: gender ("Male" or "Female"), age (number; if only Date of birth is given, calculate age as of ${today}), city, marital_status, caste, sect_maslak, height, weight, education, profession_salary, house_details, req_marital_status, req_age_range, req_city, req_caste, req_maslak, req_education, other_requirements. Use null for blank fields. Return only JSON.\n\n${prompt}`;
+        for (let i = 0; i < 1 && !c; i++) {
+          for (const m of models) {
+            try {
+              const out = await Promise.race([m.generateContent(ask), new Promise((_, rej) => setTimeout(() => rej(new Error('503 timeout')), 6000))]);
+              c = JSON.parse(out.response.text()); break;
+            }
+            catch (e) { if (!/503|429|overloaded|high demand/i.test(e.message)) throw e; }
+          }
+          if (!c) await new Promise((r) => setTimeout(r, 800 * (i + 1)));
+        }
+      } catch (e) { console.error('Gemini extraction failed:', e.message); }
+    }
+    if (c && !c.profile_id) {
+      const ra = readAge(prompt); // the age always comes from code, never from the AI
+      c.age = ra ? ra.age : null; c.age_source = ra ? ra.source : null;
+    } else if (c) c.age_source = 'database';
+    if (!c || !genderOf(c.gender) || num(c.age) == null || isNA(c.city))
+      return fail('Could not find the Gender, age and city of the candidate. Age is read only from the date of birth or an "Age: 34" line in the candidate part. Add it (for example a first line like Female/34/Lahore) or use a profile ID such as NC-102.', 422);
 
-      <div className="mt-3 grid grid-cols-2 gap-2">
-        <button onClick={() => setOpen(!open)} className="rounded-xl border border-maroon/25 bg-white px-3 py-2 text-sm font-medium text-maroon transition hover:bg-blush">
-          {open ? 'Hide Profile' : 'View Profile'}
-        </button>
-        <button onClick={onCopy} className={`rounded-xl px-3 py-2 text-sm font-medium transition active:scale-[0.98] ${copied ? 'bg-emerald-700 text-white' : 'bg-maroon text-white hover:bg-maroon-deep'}`}>
-          {copied ? '✓ Copied!' : '📋 Copy Profile for WhatsApp'}
-        </button>
-      </div>
-    </article>
-  );
-}
+    // 2) Hard rules: opposite gender only; male age >= female age (see ageCheck).
+    const want = genderOf(c.gender) === 'male' ? 'female' : 'male';
+    const unknownGender = rows.filter((p) => !genderOf(p.gender)).length;
+    const opposite = rows.filter((p) => p.profile_id !== c.profile_id && genderOf(p.gender) === want);
+    const evaluated = opposite.map((p) => evaluate(c, p)).filter(Boolean);
 
-const TRUST = [
-  [ShieldCheck, 'Verified Profiles', 'Safe & Trusted'],
-  [Sparkles, 'Smart Matching', 'AI Powered'],
-  [Lock, 'Privacy First', 'Your Data is Safe'],
-  [Users, 'Family Oriented', 'Halal & Respectful'],
-];
+    const byScore = (a, b) => b.score - a.score;
+    const best = evaluated.filter((e) => e.group === 'best').sort(byScore).slice(0, MAIN_MAX);
+    // Lower-match options are added only when the requirement-based matches are few.
+    const options = best.length < MIN_MAIN
+      ? evaluated.filter((e) => e.group === 'option' && e.score >= 30).sort(byScore).slice(0, SUGG_MAX)
+      : [];
 
-export default function Home() {
-  const [prompt, setPrompt] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
-  const [data, setData] = useState(null);
-  const ta = useRef(null);
-  const results = useRef(null);
+    const results = [...best, ...options].map(({ p, tier, score, reasons, group }) => ({
+      id: p.profile_id,
+      score,
+      tier,
+      group,
+      reasons,
+      info: { age: p.age, height: p.height, city: p.city, education: p.education, work: p.profession_salary, marital: p.marital_status, caste: p.caste, gender: p.gender },
+      text: formatProfile(p),
+    }));
 
-  useEffect(() => {
-    if (!ta.current) return;
-    ta.current.style.height = 'auto';
-    ta.current.style.height = Math.min(Math.max(ta.current.scrollHeight, 160), 420) + 'px';
-  }, [prompt]);
-
-  const run = async () => {
-    setLoading(true); setError(''); setData(null);
-    results.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    try {
-      const res = await fetch('/api/match', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt }),
-      });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error || 'Request failed');
-      setData(json);
-    } catch (e) { setError(e.message); }
-    finally { setLoading(false); }
-  };
-
-  const serif = 'font-[family-name:var(--font-serif)]';
-
-  return (
-    <div id="top" className="flex min-h-screen">
-      <aside className="sticky top-0 hidden h-screen w-60 shrink-0 flex-col border-r border-maroon/10 bg-blush p-5 lg:flex">
-        <div className="text-center">
-          <span className={`${serif} text-3xl font-semibold italic text-maroon`}>Nikah Connect</span>
-          <p className="mt-1 text-[10px] tracking-[0.15em] text-stone-500">TRUSTED BY FAMILIES FOR NIKAH</p>
-        </div>
-        <nav className="mt-8 space-y-1 text-sm">
-          {[[HomeIcon, 'Home', '#top', true], [Users, 'Find Matches', '#matcher'], [Target, 'Matching Results', '#results']].map(([Icon, label, href, on]) => (
-            <a key={label} href={href} className={`flex items-center gap-3 rounded-xl px-4 py-3 transition ${on ? 'bg-maroon text-white' : 'text-stone-700 hover:bg-white/70'}`}>
-              <Icon size={18} />{label}
-            </a>
-          ))}
-        </nav>
-        <p className={`${serif} mt-auto text-center text-sm italic leading-relaxed text-stone-500`}>
-          Nikah is not just a union of two hearts, but a union of two families in the path of Allah.
-        </p>
-      </aside>
-
-      <main className="min-w-0 flex-1">
-        <div className="border-b border-maroon/10 bg-blush px-4 py-3 text-center lg:hidden">
-          <span className={`${serif} text-2xl font-semibold italic text-maroon`}>Nikah Connect</span>
-        </div>
-        <p className={`${serif} hidden py-5 text-center text-lg italic text-gold lg:block`}>“Halal Rishton Se Behtar Koi Rasta Nahi”</p>
-
-        <div className="mx-auto grid max-w-7xl gap-6 px-4 pb-16 pt-4 lg:px-8 xl:grid-cols-[minmax(0,1.5fr)_minmax(0,1fr)]">
-          <div className="space-y-6">
-            <section className="rounded-3xl bg-gradient-to-br from-[#fbf2eb] to-[#f3e2d9] p-6 md:p-8">
-              <span className="inline-flex items-center gap-2 rounded-full bg-gold-soft px-3 py-1 text-xs font-semibold text-gold">
-                <Sparkles size={14} /> AI POWERED MATCHMAKER
-              </span>
-              <h1 className={`${serif} mt-4 text-4xl font-semibold leading-tight text-maroon md:text-5xl`}>Find Your Perfect<br />Life Partner</h1>
-              <p className="mt-3 max-w-md text-stone-600">Share the profile details and let our AI matchmaker find the most compatible matches for you.</p>
-              <div className="mt-6 grid grid-cols-2 gap-4 md:grid-cols-4">
-                {TRUST.map(([Icon, t, s]) => (
-                  <div key={t} className="flex items-center gap-2">
-                    <span className="grid size-10 shrink-0 place-items-center rounded-full bg-white/70 text-maroon"><Icon size={18} /></span>
-                    <div className="leading-tight"><p className="text-xs font-semibold text-ink">{t}</p><p className="text-[11px] text-stone-500">{s}</p></div>
-                  </div>
-                ))}
-              </div>
-            </section>
-
-            <section id="matcher" className="scroll-mt-4 rounded-3xl border border-maroon/10 bg-paper p-5 shadow-sm md:p-7">
-              <div className="flex items-start justify-between gap-3">
-                <div>
-                  <h2 className={`${serif} flex items-center gap-2 text-xl font-semibold text-ink`}><FileText size={20} className="text-maroon" />1. Paste Client Profile</h2>
-                  <p className="mt-1 text-sm text-stone-500">Copy and paste the profile details, or type a profile ID such as NC-102.</p>
-                </div>
-                <button onClick={() => { setPrompt(SAMPLE); setError(''); }} className="shrink-0 rounded-lg border border-maroon/20 px-3 py-1.5 text-xs font-medium text-maroon hover:bg-blush">Use Sample</button>
-              </div>
-              <textarea
-                ref={ta} value={prompt} maxLength={5000} onChange={(e) => setPrompt(e.target.value)}
-                placeholder={'Paste the full Nikah Connect bio-data here…\n\nExample: Gender, age, city, sect, caste, education and requirements.'}
-                className="mt-4 w-full resize-none rounded-2xl border border-maroon/15 bg-white p-4 text-sm text-ink outline-none placeholder:text-stone-400 focus:border-maroon/50 focus:ring-4 focus:ring-maroon/10"
-              />
-              <p className="mt-1 text-right text-xs text-stone-400">{prompt.length}/5000</p>
-
-              <div className="relative mt-4">
-                {!loading && <span className="absolute inset-0 rounded-2xl bg-maroon/40 blur-lg animate-pulse motion-reduce:animate-none" />}
-                <button
-                  onClick={run} disabled={loading || !prompt.trim()}
-                  className="relative flex w-full items-center justify-center gap-2 rounded-2xl bg-maroon py-4 text-base font-semibold text-white transition hover:bg-maroon-deep active:scale-[0.99] disabled:opacity-50"
-                >
-                  {loading ? <><Loader2 size={18} className="animate-spin" /> Finding matches…</> : '⚡ Run AI Matchmaker Engine'}
-                </button>
-              </div>
-            </section>
-          </div>
-
-          <section id="results" ref={results} className="scroll-mt-4 self-start rounded-3xl border border-maroon/10 bg-paper p-5 shadow-sm xl:sticky xl:top-4">
-            <h2 className={`${serif} flex items-center gap-2 text-xl font-semibold text-ink`}><Target size={20} className="text-maroon" />Matching Results</h2>
-            <p className="mt-1 text-sm text-stone-500">Top compatible matches based on your criteria</p>
-
-            {error && (
-              <p role="alert" className="mt-4 flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 p-3 text-sm text-rose-800">
-                <AlertCircle size={16} className="mt-0.5 shrink-0" />{error}
-              </p>
-            )}
-            {loading && <p className="mt-6 flex items-center gap-2 text-sm text-stone-600"><Loader2 size={16} className="animate-spin" />Checking profiles against the matching rules…</p>}
-            {!loading && !data && !error && (
-              <div className="mt-6 rounded-2xl bg-blush p-5 text-center text-sm text-stone-600">
-                <HeartHandshake className="mx-auto mb-2 text-maroon" />
-                Paste a profile on the left and press the button. Matches will appear here.
-              </div>
-            )}
-            {data && (
-              <>
-                <p className="mt-3 text-xs text-stone-500">
-                  Candidate: {data.candidate.gender}, {data.candidate.age} years{data.candidate.age_source ? ` (age read from ${data.candidate.age_source})` : ''}, {data.candidate.city}. Showing {data.showing} profiles only. Checked {data.stats.scanned}; {data.stats.disqualified} removed by the age rule{data.stats.unknownGender ? `; ${data.stats.unknownGender} profiles skipped because gender is missing in the database` : ''}.
-                </p>
-                {data.results.length === 0 ? (
-                  <p className="mt-6 text-sm text-stone-700">
-                    {data.stats.total === 0
-                      ? 'The database returned 0 profiles. Check the table name and that read access (RLS policy or service key) is set up in Supabase.'
-                      : data.stats.scanned === 0
-                      ? `No opposite-gender profiles were found among ${data.stats.total} rows. Check the Gender column values. Columns seen: ${(data.stats.columns || []).join(', ')}`
-                      : 'No suitable matches found. Try a bio-data with more detail, or check back after new profiles are added.'}
-                  </p>
-                ) : (
-                  <div className="mt-4 space-y-4 xl:max-h-[calc(100vh-11rem)] xl:overflow-y-auto xl:pr-1">
-                    {data.results.some((r) => r.group === 'best') ? (
-                      <p className="text-sm font-semibold text-emerald-800">Best matches</p>
-                    ) : (
-                      <p className="rounded-xl bg-amber-50 p-3 text-sm text-amber-900">No profile fits the stated requirement fully. These are the closest options, with lower match percentages.</p>
-                    )}
-                    {data.results.filter((r) => r.group === 'best').map((r) => <Result key={r.id} r={r} />)}
-                    {data.results.some((r) => r.group === 'option') && data.results.some((r) => r.group === 'best') && (
-                      <p className="pt-2 text-sm font-semibold text-amber-800">Other options (outside the stated requirement, lower match)</p>
-                    )}
-                    {data.results.filter((r) => r.group === 'option').map((r) => <Result key={r.id} r={r} />)}
-                  </div>
-                )}
-              </>
-            )}
-          </section>
-        </div>
-      </main>
-    </div>
-  );
+    return NextResponse.json({
+      candidate: { id: c.profile_id || null, gender: c.gender, age: num(c.age), age_source: c.age_source || null, city: c.city, marital_status: c.marital_status, caste: c.caste },
+      showing: want,
+      stats: {
+        total: rows.length,
+        scanned: opposite.length,
+        disqualified: opposite.length - evaluated.length,
+        unknownGender,
+        columns: rows.length && !opposite.length ? Object.keys(rows[0]) : undefined,
+      },
+      results,
+    });
+  } catch (e) {
+    console.error(e);
+    return fail(e.message || 'Unexpected server error.');
+  }
 }
