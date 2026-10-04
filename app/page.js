@@ -98,7 +98,7 @@ function Result({ r, cand }) {
           {Object.entries(r.chips).map(([k, v]) => <span key={k} className={`rounded-full px-2 py-0.5 text-[11px] font-medium ring-1 ${CHIP[v]}`}>{MARK[v]} {CHIP_LABEL[k] || k}</span>)}
         </div>
       )}
-      {r.also_ids?.length > 0 && <p className="mt-2 text-xs text-stone-500">Same profile also stored as {r.also_ids.join(', ')} (details combined)</p>}
+      {r.also_ids?.length > 0 && <p className="mt-2 text-xs text-stone-500">Same profile also stored as {r.also_ids.join(', ')} ({r.also_note || 'details combined'}); details combined</p>}
       <ul className="mt-3 space-y-1 border-t border-maroon/10 pt-3 text-[13px] text-stone-700">
         {r.reasons.map((x, k) => {
           const mark = x[0], text = '✓✗!'.includes(mark) ? x.slice(2) : x;
@@ -151,6 +151,7 @@ export default function Home() {
   const [error, setError] = useState('');
   const [data, setData] = useState(null);
   const [det, setDet] = useState(null);
+  const [shown, setShown] = useState(10);
   const ta = useRef(null);
   const results = useRef(null);
 
@@ -176,7 +177,7 @@ export default function Home() {
   const detMissing = det && !(det.gender && Number(det.age) > 0 && String(det.city).trim());
 
   const run = async () => {
-    setLoading(true); setError(''); setData(null);
+    setLoading(true); setError(''); setData(null); setShown(10);
     results.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     try {
       const res = await fetch('/api/match', {
@@ -308,7 +309,10 @@ export default function Home() {
             {data && (
               <>
                 <p className="mt-3 text-xs text-stone-500">
-                  Candidate: {data.candidate.gender}, {data.candidate.age} years{data.candidate.age_source ? ` (age read from ${data.candidate.age_source})` : ''}, {data.candidate.city}. Showing {data.showing} profiles only. Checked {data.stats.scanned}; {data.stats.disqualified} removed by the age rule{data.stats.unknownGender ? `; ${data.stats.unknownGender} profiles skipped because gender is missing in the database` : ''}.
+                  Candidate: {data.candidate.gender}, {data.candidate.age} years{data.candidate.age_source ? ` (age read from ${data.candidate.age_source})` : ''}, {data.candidate.city}.
+                  {' '}Searched all {data.stats.total_raw} profiles in the database{data.stats.merged ? ` (${data.stats.merged} duplicate${data.stats.merged > 1 ? 's' : ''} combined into one)` : ''}.
+                  {' '}{data.stats.scanned} {data.showing} profiles were checked one by one; {data.stats.disqualified} removed by the age rule{data.stats.unknownGender ? `; ${data.stats.unknownGender} skipped because gender is missing` : ''}.
+                  {' '}{data.stats.best_total} fit the requirement{data.stats.best_total > 10 ? ' (best 10 shown first)' : ''}.
                 </p>
                 {data.results.length === 0 ? (
                   <p className="mt-6 text-sm text-stone-700">
@@ -325,7 +329,12 @@ export default function Home() {
                     ) : (
                       <p className="rounded-xl bg-amber-50 p-3 text-sm text-amber-900">No profile fits the stated requirement fully. These are the closest options, with lower match percentages.</p>
                     )}
-                    {data.results.filter((r) => r.group === 'best').map((r) => <Result key={r.id} r={r} cand={data.candidate_data} />)}
+                    {data.results.filter((r) => r.group === 'best').slice(0, shown).map((r) => <Result key={r.id} r={r} cand={data.candidate_data} />)}
+                    {data.results.filter((r) => r.group === 'best').length > shown && (
+                      <button onClick={() => setShown(shown + 10)} className="w-full rounded-xl border border-maroon/25 bg-white py-2.5 text-sm font-medium text-maroon transition hover:bg-blush">
+                        Show {Math.min(10, data.results.filter((r) => r.group === 'best').length - shown)} more ({data.results.filter((r) => r.group === 'best').length - shown} remaining)
+                      </button>
+                    )}
                     {data.results.some((r) => r.group === 'option') && data.results.some((r) => r.group === 'best') && (
                       <p className="pt-2 text-sm font-semibold text-amber-800">Other options (outside the stated requirement, lower match)</p>
                     )}
