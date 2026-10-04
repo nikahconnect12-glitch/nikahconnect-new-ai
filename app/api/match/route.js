@@ -7,7 +7,7 @@ export const maxDuration = 60;
 
 const TABLE = process.env.SUPABASE_TABLE || 'profiles db';
 const MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash'; // used ONLY to read pasted text that does not follow the template
-const MAIN_MAX = 12;      // best matches shown
+const MAIN_MAX = 40;      // best matches returned (the page shows 10 at a time)
 const SUGG_MAX = 6;       // lower-match options shown below, only when best matches are few
 const MIN_MAIN = 5;       // fewer best matches than this -> lower-match options are added
 const MAX_AGE_GAP = 3;    // a female is NEVER more than 3 years older than the male
@@ -530,14 +530,25 @@ function samePerson(a, b) {
   if (!isNA(a.caste) && !isNA(b.caste) && !sameCaste(a.caste, b.caste)) return false;
   return true;
 }
+const fingerprint = (r) => {
+  const f = [r.gender, r.age, r.city, r.caste, r.education, r.profession_salary, r.marital_status, r.sect_maslak, r.house_details]
+    .map((v) => (isNA(v) ? '' : String(v).toLowerCase().replace(/[^a-z0-9]/g, '')));
+  return f[0] && f[1] && f.filter(Boolean).length >= 7 ? f.join('|') : null; // 7+ of 9 key details identical
+};
 function mergeDuplicates(rows) {
-  const byPhone = new Map();
-  rows.forEach((r, i) => phoneSet(r.contact_number).forEach((p) => { if (!byPhone.has(p)) byPhone.set(p, []); byPhone.get(p).push(i); }));
   const parent = rows.map((_, i) => i);
   const find = (i) => { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; };
+  const union = (a, b) => { parent[find(b)] = find(a); };
+  const byPhone = new Map(), byPrint = new Map();
+  rows.forEach((r, i) => {
+    phoneSet(r.contact_number).forEach((p) => { if (!byPhone.has(p)) byPhone.set(p, []); byPhone.get(p).push(i); });
+    const k = fingerprint(r);
+    if (k) { if (!byPrint.has(k)) byPrint.set(k, []); byPrint.get(k).push(i); }
+  });
   for (const idx of byPhone.values())
     for (let i = 0; i < idx.length; i++) for (let j = i + 1; j < idx.length; j++)
-      if (samePerson(rows[idx[i]], rows[idx[j]])) parent[find(idx[j])] = find(idx[i]);
+      if (samePerson(rows[idx[i]], rows[idx[j]])) union(idx[i], idx[j]);
+  for (const idx of byPrint.values()) for (let i = 1; i < idx.length; i++) union(idx[0], idx[i]);
   const groups = new Map();
   rows.forEach((r, i) => { const k = find(i); if (!groups.has(k)) groups.set(k, []); groups.get(k).push(r); });
   return [...groups.values()].map((g) => {
@@ -546,6 +557,9 @@ function mergeDuplicates(rows) {
     const merged = { ...sorted[0] };
     for (const r of sorted.slice(1)) for (const [k, v] of Object.entries(r)) if (isNA(merged[k]) && !isNA(v)) merged[k] = v;
     merged.also_ids = sorted.slice(1).map((r) => r.profile_id);
+    const rest = sorted.slice(1);
+    merged.also_note = rest.every((r) => phonesOverlap(sorted[0].contact_number, r.contact_number)) ? 'same contact number'
+      : rest.some((r) => !phoneSet(r.contact_number).size) || !phoneSet(sorted[0].contact_number).size ? 'identical details' : 'identical details, different contact number';
     return merged;
   });
 }
@@ -610,7 +624,7 @@ export async function GET() {
       new_caste_words: tally(rows.flatMap((r) => [r.caste, r.req_caste]), (v) => casteTokens(v).filter((t) => !KNOWN_CASTE.has(t) && !CASTE_GROUPS[t])),
       unrecognised_sect_values: tally(rows.flatMap((r) => [r.sect_maslak, r.req_maslak]), (v) => (!isNA(v) && !sectKinds(v).size && !/^(islam|muslim|any)$/i.test(String(v).trim()) ? [String(v).trim()] : [])),
       duplicate_profiles_merged: rows.length - mergeDuplicates(rows).length,
-      duplicate_examples: mergeDuplicates(rows).filter((r) => r.also_ids).slice(0, 25).map((r) => [r.profile_id, ...r.also_ids]),
+      duplicate_examples: mergeDuplicates(rows).filter((r) => r.also_ids).slice(0, 30).map((r) => ({ ids: [r.profile_id, ...r.also_ids], reason: r.also_note })),
       rows_without_numeric_age: rows.filter((r) => num(r.age) == null).length,
       distinct_gender_values: [...new Set(raw.map((r) => String(r[mapping.gender] ?? '')))].slice(0, 10),
     });
@@ -700,11 +714,11 @@ export async function POST(req) {
     const evaluated = opposite.map((p) => evaluate(c, p)).filter(Boolean);
 
     const byScore = (a, b) => b.score - a.score;
-    const best = evaluated.filter((e) => e.group === 'best').sort(byScore).slice(0, MAIN_MAX);
+    const bestAll = evaluated.filter((e) => e.group === 'best').sort(byScore);
+    const best = bestAll.slice(0, MAIN_MAX);
     // Lower-match options are added only when the requirement-based matches are few.
-    const options = best.length < MIN_MAIN
-      ? evaluated.filter((e) => e.group === 'option' && e.score >= 30).sort(byScore).slice(0, SUGG_MAX)
-      : [];
+    const optionsAll = evaluated.filter((e) => e.group === 'option' && e.score >= 30).sort(byScore);
+    const options = best.length < MIN_MAIN ? optionsAll.slice(0, SUGG_MAX) : [];
 
     const results = [...best, ...options].map(({ p, tier, score, reasons, group, chips, verdict }) => ({
       id: p.profile_id,
@@ -714,6 +728,7 @@ export async function POST(req) {
       chips,
       verdict,
       also_ids: p.also_ids || [],
+      also_note: p.also_note || '',
       reasons: phonesOverlap(c.contact_number, p.contact_number) ? [...reasons, '! Same contact number as the candidate (same family or same agent)'] : reasons,
       info: { age: p.age, height: p.height, city: p.city, education: p.education, work: p.profession_salary, marital: p.marital_status, caste: p.caste, gender: p.gender },
       text: formatProfile(p),
@@ -724,8 +739,13 @@ export async function POST(req) {
       candidate_data: noteFacts(c),
       showing: want,
       stats: {
+        total_raw: allRows.length,
+        merged: allRows.length - rows.length,
         total: rows.length,
         scanned: opposite.length,
+        evaluated: evaluated.length,
+        best_total: bestAll.length,
+        options_total: optionsAll.length,
         disqualified: opposite.length - evaluated.length,
         unknownGender,
         columns: rows.length && !opposite.length ? Object.keys(rows[0]) : undefined,
